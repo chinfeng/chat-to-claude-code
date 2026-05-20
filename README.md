@@ -6,12 +6,12 @@
 
 ```
 Claude Code CLI
-    │  Anthropic API (SSE)
-    ▼
-chat-to-claude-code  ────►  OpenAI /chat/completions (SSE)
-    │                          (NVIDIA NIM / OpenAI / Ollama / LM Studio / ...)
-    │  Anthropic SSE
-    ▼
+  │ Anthropic API (SSE)
+  ▼
+chat-to-claude-code ────► OpenAI /chat/completions (SSE)
+  │ (NVIDIA NIM / OpenAI / Ollama / LM Studio / ...)
+  │ Anthropic SSE
+  ▼
 Claude Code CLI 收到标准 Anthropic 响应
 ```
 
@@ -21,6 +21,7 @@ Claude Code CLI 收到标准 Anthropic 响应
 - **流式 SSE** — OpenAI 流式 chunk 实时转为 Anthropic SSE 事件
 - **Thinking 支持** — `reasoning_content` 和 `<think>` 标签两种推理格式均转 Anthropic thinking block
 - **工具调用** — 原生 `tool_calls` 和文本形式的 `● <function=...>` 启发式解析均支持
+- **下游鉴权** — 可选 `--auth-token` 对接入方进行 x-api-key 验证
 - **零依赖** — 纯 Bun runtime，无外部 npm 包
 
 ## 快速开始
@@ -31,37 +32,14 @@ Claude Code CLI 收到标准 Anthropic 响应
 curl -fsSL https://bun.sh/install | bash
 ```
 
-### 2. 配置环境变量
+### 2. 启动代理
+
+所有配置通过 CLI 参数传入：
 
 ```bash
-# 必填：上游 OpenAI 兼容端点
-export UPSTREAM_BASE_URL="https://integrate.api.nvidia.com/v1"
-
-# 必填：API Key
-export API_KEY="nvapi-xxxx"
-
-# 可选：是否透传客户端 API Key（默认 true）
-export ENABLE_API_KEY_PASSTHROUGH="true"
-
-# 可选：是否启用 thinking（默认 true）
-export ENABLE_THINKING="true"
-
-# 可选：默认模型名（默认 gpt-4o）
-# 注意：本项目不做模型名前缀路由，值会原样传给上游端点。
-# 请填写上游端点所要求的模型 ID（如 NIM API 的 "nvidia/nemotron-3-super-120b-a12b",
-# OpenAI 的 "gpt-4o" 等）。
-export DEFAULT_MODEL="nvidia/nemotron-3-super-120b-a12b"
-
-# 可选：服务端口（默认 8082）
-export PORT="8082"
-```
-
-### 3. 启动代理
-
-```bash
-bun run src/server/index.ts
-# 或
-bun run start
+bun run src/server/index.ts \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx
 ```
 
 输出：
@@ -69,11 +47,13 @@ bun run start
 ```
 chat-to-claude-code listening on http://localhost:8082
   Upstream: https://integrate.api.nvidia.com/v1
-  API key passthrough: true
+  Upstream API key: configured
+  Auth token: not set
+  Passthrough mode: false
   Thinking: true
 ```
 
-### 4. 连接 Claude Code
+### 3. 连接 Claude Code
 
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:8082"
@@ -87,16 +67,71 @@ claude
 ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 ```
 
-## 环境变量参考
+## CLI 参数参考
 
-| 变量 | 默认值 | 说明 |
+| 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | 上游 OpenAI Chat Completions 兼容端点 |
-| `API_KEY` | `""` | 服务端持有的 API Key；客户端未提供时使用此值 |
-| `ENABLE_API_KEY_PASSTHROUGH` | `true` | `true` = 透传客户端 `x-api-key` / `Authorization` 头 |
-| `ENABLE_THINKING` | `true` | 是否将上游推理内容转为 Anthropic thinking block |
-| `DEFAULT_MODEL` | `gpt-4o` | 请求未指定模型时的回退值；原样传给上游，无前缀路由 |
-| `PORT` | `8082` | HTTP 监听端口 |
+| `--upstream-base-url` | `https://api.openai.com/v1` | 上游 OpenAI Chat Completions 兼容端点 |
+| `--upstream-api-key` | `""` | 上游 API Key；用于请求上游端点时的鉴权 |
+| `--auth-token` | `""` | 下游鉴权 Token；设置后客户端需在 x-api-key 头部提供匹配的值 |
+| `--port` | `8082` | HTTP 监听端口 |
+| `--enable-thinking` | `true` | 将上游推理内容转为 Anthropic thinking block |
+| `--no-enable-thinking` | — | 禁用 thinking 转换 |
+
+### 透传模式
+
+当 `--upstream-api-key` 与 `--auth-token` 均未配置时，自动启用透传模式：客户端通过 `x-api-key` 或 `Authorization` 头部传入的 Key 将原样转发给上游端点。
+
+### 下游鉴权
+
+设置 `--auth-token` 后，客户端请求必须携带匹配的 `x-api-key` 或 `Authorization: Bearer xxx` 头部，否则返回 401。此功能用于保护代理不被未授权的客户端调用。
+
+## 打包为单文件可执行
+
+```bash
+bun run build
+```
+
+生成 `chat-to-claude-code`（Windows 下为 `chat-to-claude-code.exe`），可直接运行：
+
+```bash
+./chat-to-claude-code \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx \
+  --port 8082
+```
+
+## Docker 容器化部署
+
+### 构建镜像
+
+```bash
+docker build -t chat-to-claude-code .
+```
+
+### 运行容器
+
+```bash
+docker run -p 8082:8082 chat-to-claude-code \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx
+```
+
+带下游鉴权：
+
+```bash
+docker run -p 8082:8082 chat-to-claude-code \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx \
+  --auth-token my-secret-token
+```
+
+透传模式（无需任何 Key）：
+
+```bash
+docker run -p 8082:8082 chat-to-claude-code \
+  --upstream-base-url http://localhost:11434/v1
+```
 
 ## API 端点
 
@@ -106,6 +141,8 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `/health` | GET | 健康检查 |
 
 未匹配路径返回 `404` + Anthropic 格式错误体。
+
+**注意**：`model` 字段为必填，请求体中必须包含 `model` 字段，否则返回错误。
 
 ## 转换细节
 
@@ -160,41 +197,39 @@ Use WebSearch {"query": "test query"}
 ### NVIDIA NIM
 
 ```bash
-export UPSTREAM_BASE_URL="https://integrate.api.nvidia.com/v1"
-export API_KEY="nvapi-your-key"
-export DEFAULT_MODEL="nvidia_nim/z-ai/glm-5.1"
+bun run src/server/index.ts \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-your-key
 ```
 
 ### OpenAI
 
 ```bash
-export UPSTREAM_BASE_URL="https://api.openai.com/v1"
-export API_KEY="sk-your-key"
-export DEFAULT_MODEL="gpt-4o"
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-your-key
 ```
 
 ### Ollama（本地）
 
 ```bash
-export UPSTREAM_BASE_URL="http://localhost:11434/v1"
-export API_KEY="ollama"
-export DEFAULT_MODEL="llama3.1"
+bun run src/server/index.ts \
+  --upstream-base-url http://localhost:11434/v1
 ```
 
 ### LM Studio（本地）
 
 ```bash
-export UPSTREAM_BASE_URL="http://localhost:1234/v1"
-export API_KEY="lm-studio"
-export DEFAULT_MODEL="lm-studio-model"
+bun run src/server/index.ts \
+  --upstream-base-url http://localhost:1234/v1
 ```
 
 ### OpenRouter
 
 ```bash
-export UPSTREAM_BASE_URL="https://openrouter.ai/api/v1"
-export API_KEY="sk-or-your-key"
-export DEFAULT_MODEL="deepseek/deepseek-chat-v3-0324:free"
+bun run src/server/index.ts \
+  --upstream-base-url https://openrouter.ai/api/v1 \
+  --upstream-api-key sk-or-your-key
 ```
 
 ## 开发
@@ -204,23 +239,23 @@ export DEFAULT_MODEL="deepseek/deepseek-chat-v3-0324:free"
 ```
 src/
 ├── conversion/
-│   └── converter.ts      # Anthropic → OpenAI 消息/工具/系统提示转换
+│   └── converter.ts   # Anthropic → OpenAI 消息/工具/系统提示转换
 ├── core/
-│   ├── errors.ts         # Anthropic 格式错误响应
-│   └── tokens.ts         # Token 估算（char/4 启发式）
+│   ├── errors.ts      # Anthropic 格式错误响应
+│   └── tokens.ts      # Token 估算（char/4 启发式）
 ├── parsers/
-│   ├── think_tag_parser.ts       # <think> 标签流式解析
-│   └── heuristic_tool_parser.ts  # ● <function=...> 启发式工具调用解析
+│ ├── think_tag_parser.ts      # think tag streaming parser
+│   └── heuristic_tool_parser.ts    # ● <function=...> 启发式工具调用解析
 ├── server/
-│   ├── config.ts         # 环境变量配置加载
-│   ├── index.ts          # Bun.serve() 入口 + CORS
-│   └── routes.ts         # HTTP 路由处理
+│   ├── config.ts      # CLI 参数配置加载
+│   ├── index.ts       # Bun.serve() 入口 + CORS
+│   └── routes.ts      # HTTP 路由处理 + 鉴权
 ├── sse/
-│   └── builder.ts        # Anthropic SSE 事件构建器
+│   └── builder.ts     # Anthropic SSE 事件构建器
 ├── transport/
-│   └── stream.ts         # OpenAI 流 → Anthropic SSE 流式转换
+│   └── stream.ts      # OpenAI 流 → Anthropic SSE 流式转换
 └── utils/
-    └── helpers.ts        # 通用工具函数
+    └── helpers.ts     # 通用工具函数
 ```
 
 ### 运行测试
@@ -232,13 +267,19 @@ bun test
 ### 开发模式（文件变更自动重启）
 
 ```bash
-bun run dev
+bun run dev -- --upstream-base-url https://integrate.api.nvidia.com/v1 --upstream-api-key nvapi-xxxx
 ```
 
 ### 类型检查
 
 ```bash
 bunx tsc --noEmit
+```
+
+### 打包
+
+```bash
+bun run build
 ```
 
 ## 与 free-claude-code (Python) 的差异
@@ -251,6 +292,10 @@ bunx tsc --noEmit
 | 外部依赖 | FastAPI, Pydantic, httpx, tiktoken 等 | 零 |
 | Provider 数量 | 11 (NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI) | 1（通用 OpenAI 兼容端点） |
 | Model Router | Opus/Sonnet/Haiku 多 provider 路由 | 无（单一 upstream） |
+| 配置方式 | 环境变量 | CLI 启动参数 |
+| 下游鉴权 | 无 | AUTH_TOKEN 验证 |
+| 可执行文件 | 无 | bun build --compile 单文件 |
+| 容器化 | 无 | Dockerfile (distroless) |
 | Admin UI | 本地 Web 配置界面 | 无 |
 | 请求优化 | quota mock / title skip / prefix detection / filepath mock | 无 |
 | Discord/Telegram Bot | 完整 bot 集成 | 无 |
