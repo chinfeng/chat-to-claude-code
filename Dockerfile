@@ -6,7 +6,7 @@ COPY src/ src/
 COPY tsconfig.json ./
 RUN bun build src/server/index.ts --compile --outfile chat-to-claude-code
 
-FROM alpine:3.22
+FROM debian:bookworm-slim
 COPY --from=builder /build/chat-to-claude-code /app/chat-to-claude-code
 EXPOSE 8082
 ENTRYPOINT ["/app/chat-to-claude-code"]
