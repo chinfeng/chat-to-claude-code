@@ -120,7 +120,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   }
 
   const parsed = parseMessagesBody(body);
-  if ("error" in parsed) {
+  if ("error" in parsed && parsed.error) {
     return Response.json(parsed.error.json, { status: parsed.error.status });
   }
 

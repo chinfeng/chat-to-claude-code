@@ -413,9 +413,13 @@ export class AnthropicToOpenAIConverter {
               pending.deferredEmitted = true;
               pending = null;
             }
-            const pieces = _convertUserMessageWithInjection(content, pending);
-            result.push(...pieces.messages);
-            if (pieces.clearedPending) pending = null;
+            if (pending !== null) {
+              const pieces = _convertUserMessageWithInjection(content, pending);
+              result.push(...pieces.messages);
+              if (pieces.clearedPending) pending = null;
+            } else {
+              result.push(..._convertUserMessage(content));
+            }
           } else {
             result.push(..._convertUserMessage(content));
           }
