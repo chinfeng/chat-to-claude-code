@@ -47,7 +47,10 @@ export ENABLE_API_KEY_PASSTHROUGH="true"
 export ENABLE_THINKING="true"
 
 # 可选：默认模型名（默认 gpt-4o）
-export DEFAULT_MODEL="nvidia_nim/z-ai/glm-5.1"
+# 注意：本项目不做模型名前缀路由，值会原样传给上游端点。
+# 请填写上游端点所要求的模型 ID（如 NIM API 的 "nvidia/nemotron-3-super-120b-a12b",
+# OpenAI 的 "gpt-4o" 等）。
+export DEFAULT_MODEL="nvidia/nemotron-3-super-120b-a12b"
 
 # 可选：服务端口（默认 8082）
 export PORT="8082"
@@ -92,7 +95,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `API_KEY` | `""` | 服务端持有的 API Key；客户端未提供时使用此值 |
 | `ENABLE_API_KEY_PASSTHROUGH` | `true` | `true` = 透传客户端 `x-api-key` / `Authorization` 头 |
 | `ENABLE_THINKING` | `true` | 是否将上游推理内容转为 Anthropic thinking block |
-| `DEFAULT_MODEL` | `gpt-4o` | 请求未指定模型时的回退值 |
+| `DEFAULT_MODEL` | `gpt-4o` | 请求未指定模型时的回退值；原样传给上游，无前缀路由 |
 | `PORT` | `8082` | HTTP 监听端口 |
 
 ## API 端点
@@ -240,7 +243,7 @@ bunx tsc --noEmit
 
 ## 与 free-claude-code (Python) 的差异
 
-本项目是 [free-claude-code](https://github.com/Alishahryar1/free-claude-code) 的 TypeScript/Bun 精简移植，聚焦核心协议转换功能：
+本项目是 [free-claude-code](https://github.com/chinfeng/free-claude-code) 的 TypeScript/Bun 精简移植，聚焦核心协议转换功能：
 
 | 特性 | Python 版 | 本项目 (TS/Bun) |
 |------|-----------|----------------|
