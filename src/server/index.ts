@@ -1,4 +1,4 @@
-/** Bun.serve() entry point for free-claude-code. */
+/** Bun.serve() entry point for chat-to-claude-code. */
 
 import { loadConfig } from "./config.js";
 import { routeRequest } from "./routes.js";
@@ -29,7 +29,7 @@ const server = Bun.serve({
   },
 });
 
-console.log(`free-claude-code (Bun) listening on http://localhost:${server.port}`);
+console.log(`chat-to-claude-code listening on http://localhost:${server.port}`);
 console.log(`  Upstream: ${config.upstreamBaseUrl}`);
 console.log(`  API key passthrough: ${config.enableApiKeyPassthrough}`);
 console.log(`  Thinking: ${config.enableThinking}`);
