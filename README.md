@@ -1,40 +1,51 @@
 # chat-to-claude-code
 
-将任意 OpenAI Chat Completions 兼容端点转为 Anthropic Messages API，让 Claude Code CLI 直接使用。
+Convert any OpenAI Chat Completions compatible endpoint to the Anthropic Messages API, enabling Claude Code CLI to use it directly.
 
-## 工作原理
+[中文文档](README-zh.md)
+
+## Design Philosophy
+
+This project follows the Unix philosophy: **one process, one upstream endpoint**. If you need multiple upstreams (e.g. different models or providers), run multiple processes on different ports and let the client or a load balancer handle routing. Benefits:
+
+- Each process is simple, predictable, and easy to debug
+- No built-in routing state — processes are stateless, start and stop at will
+- Independent scaling and rolling upgrades without cross-contamination
+
+## How It Works
 
 ```
 Claude Code CLI
-  │ Anthropic API (SSE)
-  ▼
+    │  Anthropic API (SSE)
+    ▼
 chat-to-claude-code ────► OpenAI /chat/completions (SSE)
-  │ (NVIDIA NIM / OpenAI / Ollama / LM Studio / ...)
-  │ Anthropic SSE
-  ▼
-Claude Code CLI 收到标准 Anthropic 响应
+                            │  (NVIDIA NIM / OpenAI / Ollama / LM Studio / ...)
+    │  Anthropic SSE
+    ▼
+Claude Code CLI receives standard Anthropic response
 ```
 
-核心能力：
+Key features:
 
-- **协议转换** — Anthropic Messages API ↔ OpenAI Chat Completions 双向转换
-- **流式 SSE** — OpenAI 流式 chunk 实时转为 Anthropic SSE 事件
-- **Thinking 支持** — `reasoning_content` 和 `<think>` 标签两种推理格式均转 Anthropic thinking block
-- **工具调用** — 原生 `tool_calls` 和文本形式的 `● <function=...>` 启发式解析均支持
-- **下游鉴权** — 可选 `--auth-token` 对接入方进行 x-api-key 验证
-- **零依赖** — 纯 Bun runtime，无外部 npm 包
+- **Protocol conversion** — Anthropic Messages API ↔ OpenAI Chat Completions bidirectional translation
+- **Streaming SSE** — OpenAI streaming chunks converted to Anthropic SSE events in real time
+- **Thinking support** — Both `reasoning_content` and thinking tag formats are converted to Anthropic thinking blocks
+- **Tool calls** — Both native `tool_calls` and heuristic text-based `● <function=...>` parsing are supported
+- **Downstream auth** — Optional `--auth-token` for x-api-key verification of connecting clients
+- **Request dumping** — Optional `--dump <dir>` records full request/response for debugging
+- **Zero dependencies** — Pure Bun runtime, no external npm packages
 
-## 快速开始
+## Quick Start
 
-### 1. 安装 Bun
+### 1. Install Bun
 
 ```bash
 curl -fsSL https://bun.sh/install | bash
 ```
 
-### 2. 启动代理
+### 2. Start the proxy
 
-所有配置通过 CLI 参数传入：
+All configuration is passed via CLI arguments:
 
 ```bash
 bun run src/server/index.ts \
@@ -42,7 +53,7 @@ bun run src/server/index.ts \
   --upstream-api-key nvapi-xxxx
 ```
 
-输出：
+Output:
 
 ```
 chat-to-claude-code listening on http://localhost:8082
@@ -51,9 +62,10 @@ chat-to-claude-code listening on http://localhost:8082
   Auth token: not set
   Passthrough mode: false
   Thinking: true
+  Dump: disabled
 ```
 
-### 3. 连接 Claude Code
+### 3. Connect Claude Code
 
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:8082"
@@ -61,38 +73,59 @@ export ANTHROPIC_AUTH_TOKEN="your-token-here"
 claude
 ```
 
-或在单行中启动：
+Or as a one-liner:
 
 ```bash
 ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 ```
 
-## CLI 参数参考
+## CLI Arguments Reference
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--upstream-base-url` | `https://api.openai.com/v1` | 上游 OpenAI Chat Completions 兼容端点 |
-| `--upstream-api-key` | `""` | 上游 API Key；用于请求上游端点时的鉴权 |
-| `--auth-token` | `""` | 下游鉴权 Token；设置后客户端需在 x-api-key 头部提供匹配的值 |
-| `--port` | `8082` | HTTP 监听端口 |
-| `--enable-thinking` | `true` | 将上游推理内容转为 Anthropic thinking block |
-| `--no-enable-thinking` | — | 禁用 thinking 转换 |
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--upstream-base-url` | `https://api.openai.com/v1` | Upstream OpenAI Chat Completions compatible endpoint |
+| `--upstream-api-key` | `""` | Upstream API key for authenticating with the upstream endpoint |
+| `--auth-token` | `""` | Downstream auth token; clients must provide a matching x-api-key header when set |
+| `--port` | `8082` | HTTP listen port |
+| `--enable-thinking` | `true` | Convert upstream reasoning content to Anthropic thinking blocks |
+| `--no-enable-thinking` | — | Disable thinking conversion |
+| `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
 
-### 透传模式
+### Passthrough Mode
 
-当 `--upstream-api-key` 与 `--auth-token` 均未配置时，自动启用透传模式：客户端通过 `x-api-key` 或 `Authorization` 头部传入的 Key 将原样转发给上游端点。
+When both `--upstream-api-key` and `--auth-token` are unset, passthrough mode is automatically enabled: the key provided by the client via `x-api-key` or `Authorization` header is forwarded as-is to the upstream endpoint.
 
-### 下游鉴权
+### Downstream Auth
 
-设置 `--auth-token` 后，客户端请求必须携带匹配的 `x-api-key` 或 `Authorization: Bearer xxx` 头部，否则返回 401。此功能用于保护代理不被未授权的客户端调用。
+When `--auth-token` is set, client requests must include a matching `x-api-key` or `Authorization: Bearer xxx` header, otherwise a 401 is returned. This protects the proxy from unauthorized access.
 
-## 打包为单文件可执行
+### Request Dumping
+
+Enable `--dump <dir>` to log each downstream request into a sequentially numbered directory containing `request.log` and `response.log`. On completion, the directory is renamed to `{seq}-{startTime}-{endTime}` for chronological sorting. Full SSE event streams are also captured.
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx \
+  --dump /var/log/chat-to-claude-code
+```
+
+Example dump directory structure:
+
+```
+/var/log/chat-to-claude-code/
+└── 1-2026-05-20T08-30-00-000Z-2026-05-20T08-30-05-123Z/
+    ├── request.log
+    └── response.log
+```
+
+## Build as Single Executable
 
 ```bash
 bun run build
 ```
 
-生成 `chat-to-claude-code`（Windows 下为 `chat-to-claude-code.exe`），可直接运行：
+Produces `chat-to-claude-code` (`chat-to-claude-code.exe` on Windows), which can be run directly:
 
 ```bash
 ./chat-to-claude-code \
@@ -101,15 +134,15 @@ bun run build
   --port 8082
 ```
 
-## Docker 容器化部署
+## Docker Deployment
 
-### 构建镜像
+### Build image
 
 ```bash
 docker build -t chat-to-claude-code .
 ```
 
-### 运行容器
+### Run container
 
 ```bash
 docker run -p 8082:8082 chat-to-claude-code \
@@ -117,7 +150,7 @@ docker run -p 8082:8082 chat-to-claude-code \
   --upstream-api-key nvapi-xxxx
 ```
 
-带下游鉴权：
+With downstream auth:
 
 ```bash
 docker run -p 8082:8082 chat-to-claude-code \
@@ -126,48 +159,48 @@ docker run -p 8082:8082 chat-to-claude-code \
   --auth-token my-secret-token
 ```
 
-透传模式（无需任何 Key）：
+Passthrough mode (no keys needed):
 
 ```bash
 docker run -p 8082:8082 chat-to-claude-code \
   --upstream-base-url http://localhost:11434/v1
 ```
 
-## API 端点
+## API Endpoints
 
-| 路径 | 方法 | 说明 |
-|------|------|------|
-| `/v1/messages` | POST | Anthropic Messages API 代理（核心端点） |
-| `/health` | GET | 健康检查 |
+| Path | Method | Description |
+|------|--------|-------------|
+| `/v1/messages` | POST | Anthropic Messages API proxy (core endpoint) |
+| `/health` | GET | Health check |
 
-未匹配路径返回 `404` + Anthropic 格式错误体。
+Unmatched paths return `404` with an Anthropic-format error body.
 
-**注意**：`model` 字段为必填，请求体中必须包含 `model` 字段，否则返回错误。
+**Note**: The `model` field is required in the request body; omitting it returns an error.
 
-## 转换细节
+## Conversion Details
 
-### 消息转换
+### Message Conversion
 
-| Anthropic | OpenAI | 说明 |
-|-----------|--------|------|
-| `system` (string / content blocks) | `{"role": "system", "content": "..."}` | 系统提示提取为 system message |
-| `tool_use` block | `tool_calls[i]` | 工具调用参数 JSON 序列化 |
-| `tool_result` block | `{"role": "tool", "tool_call_id": "..."}` | 工具结果序列化为 tool message |
-| `thinking` block | `<think>...</think>` 标签嵌入 content | 由 `ReasoningReplayMode` 控制 |
-| `redacted_thinking` block | 丢弃 | 不转发至上游 |
+| Anthropic | OpenAI | Description |
+|-----------|--------|-------------|
+| `system` (string / content blocks) | `{"role": "system", "content": "..."}` | System prompt extracted as system message |
+| `tool_use` block | `tool_calls[i]` | Tool call arguments JSON-serialized |
+| `tool_result` block | `{"role": "tool", "tool_call_id": "..."}` | Tool result serialized as tool message |
+| `thinking` block | thinking tag embedded in content | Controlled by `ReasoningReplayMode` |
+| `redacted_thinking` block | Dropped | Not forwarded upstream |
 
-### 流式 SSE 事件映射
+### Streaming SSE Event Mapping
 
 | OpenAI chunk | Anthropic SSE event |
 |-------------|-------------------|
 | `delta.reasoning_content` | `content_block_start(thinking)` + `content_block_delta(thinking_delta)` |
-| `delta.content` (含 `<think>` 标签) | 解析后分发为 thinking / text delta |
-| `delta.content` (纯文本) | `content_block_delta(text_delta)` |
+| `delta.content` (contains thinking tag) | Parsed and dispatched as thinking / text delta |
+| `delta.content` (plain text) | `content_block_delta(text_delta)` |
 | `delta.tool_calls` | `content_block_start(tool_use)` + `content_block_delta(input_json_delta)` |
 | `finish_reason: "stop"` | `message_delta(stop_reason: "end_turn")` |
 | `finish_reason: "tool_calls"` | `message_delta(stop_reason: "tool_use")` |
 
-### Stop Reason 映射
+### Stop Reason Mapping
 
 | OpenAI | Anthropic |
 |--------|-----------|
@@ -175,24 +208,24 @@ docker run -p 8082:8082 chat-to-claude-code \
 | `length` | `max_tokens` |
 | `tool_calls` | `tool_use` |
 | `content_filter` | `end_turn` |
-| 其他 | `end_turn` |
+| other | `end_turn` |
 
-### 启发式工具调用解析
+### Heuristic Tool Call Parsing
 
-部分模型不返回原生 `tool_calls`，而是将工具调用以文本形式输出：
+Some models don't return native `tool_calls` but emit tool invocations as text:
 
 ```
 ● <function=read_file><parameter=path>/etc/hosts</parameter>
 ```
 
-解析器会将其转为结构化 `tool_use` block。同时支持 WebFetch / WebSearch 的 JSON 文本格式：
+The parser converts these to structured `tool_use` blocks. It also supports WebFetch / WebSearch JSON text format:
 
 ```
 Use WebFetch {"url": "https://example.com"}
 Use WebSearch {"query": "test query"}
 ```
 
-## 常用 Provider 配置示例
+## Provider Configuration Examples
 
 ### NVIDIA NIM
 
@@ -210,14 +243,14 @@ bun run src/server/index.ts \
   --upstream-api-key sk-your-key
 ```
 
-### Ollama（本地）
+### Ollama (local)
 
 ```bash
 bun run src/server/index.ts \
   --upstream-base-url http://localhost:11434/v1
 ```
 
-### LM Studio（本地）
+### LM Studio (local)
 
 ```bash
 bun run src/server/index.ts \
@@ -232,77 +265,79 @@ bun run src/server/index.ts \
   --upstream-api-key sk-or-your-key
 ```
 
-## 开发
+## Development
 
-### 项目结构
+### Project Structure
 
 ```
 src/
 ├── conversion/
-│   └── converter.ts   # Anthropic → OpenAI 消息/工具/系统提示转换
+│   └── converter.ts       # Anthropic → OpenAI message/tool/system-prompt conversion
 ├── core/
-│   ├── errors.ts      # Anthropic 格式错误响应
-│   └── tokens.ts      # Token 估算（char/4 启发式）
+│   ├── dump.ts            # Request/response dump logger
+│   ├── errors.ts          # Anthropic-format error responses
+│   └── tokens.ts          # Token estimation (char/4 heuristic)
 ├── parsers/
-│ ├── think_tag_parser.ts      # think tag streaming parser
-│   └── heuristic_tool_parser.ts    # ● <function=...> 启发式工具调用解析
+│   ├── think_tag_parser.ts       # Think tag streaming parser
+│   └── heuristic_tool_parser.ts  # ● <function=...> heuristic tool call parser
 ├── server/
-│   ├── config.ts      # CLI 参数配置加载
-│   ├── index.ts       # Bun.serve() 入口 + CORS
-│   └── routes.ts      # HTTP 路由处理 + 鉴权
+│   ├── config.ts          # CLI argument configuration loader
+│   ├── index.ts           # Bun.serve() entry point + CORS
+│   └── routes.ts          # HTTP route handling + auth
 ├── sse/
-│   └── builder.ts     # Anthropic SSE 事件构建器
+│   └── builder.ts         # Anthropic SSE event builder
 ├── transport/
-│   └── stream.ts      # OpenAI 流 → Anthropic SSE 流式转换
+│   └── stream.ts          # OpenAI stream → Anthropic SSE stream converter
 └── utils/
-    └── helpers.ts     # 通用工具函数
+    └── helpers.ts         # General utility functions
 ```
 
-### 运行测试
+### Run Tests
 
 ```bash
 bun test
 ```
 
-### 开发模式（文件变更自动重启）
+### Dev Mode (auto-restart on file change)
 
 ```bash
 bun run dev -- --upstream-base-url https://integrate.api.nvidia.com/v1 --upstream-api-key nvapi-xxxx
 ```
 
-### 类型检查
+### Type Check
 
 ```bash
 bunx tsc --noEmit
 ```
 
-### 打包
+### Build
 
 ```bash
 bun run build
 ```
 
-## 与 free-claude-code (Python) 的差异
+## Differences from free-claude-code (Python)
 
-本项目是 [free-claude-code](https://github.com/chinfeng/free-claude-code) 的 TypeScript/Bun 精简移植，聚焦核心协议转换功能：
+This project is a streamlined TypeScript/Bun port of [free-claude-code](https://github.com/chinfeng/free-claude-code), focused on core protocol conversion:
 
-| 特性 | Python 版 | 本项目 (TS/Bun) |
-|------|-----------|----------------|
-| 运行时 | Python 3.14 + FastAPI | Bun |
-| 外部依赖 | FastAPI, Pydantic, httpx, tiktoken 等 | 零 |
-| Provider 数量 | 11 (NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI) | 1（通用 OpenAI 兼容端点） |
-| Model Router | Opus/Sonnet/Haiku 多 provider 路由 | 无（单一 upstream） |
-| 配置方式 | 环境变量 | CLI 启动参数 |
-| 下游鉴权 | 无 | AUTH_TOKEN 验证 |
-| 可执行文件 | 无 | bun build --compile 单文件 |
-| 容器化 | 无 | Dockerfile (distroless) |
-| Admin UI | 本地 Web 配置界面 | 无 |
-| 请求优化 | quota mock / title skip / prefix detection / filepath mock | 无 |
-| Discord/Telegram Bot | 完整 bot 集成 | 无 |
-| Web Server Tools | 代理端 web_search / web_fetch | 无 |
-| Rate Limiting | 令牌桶限速 | 无 |
-| Token 计数 | tiktoken (cl100k_base) | char/4 估算 |
-| 日志/追踪 | loguru + 结构化 trace | console |
+| Feature | Python version | This project (TS/Bun) |
+|---------|---------------|----------------------|
+| Runtime | Python 3.14 + FastAPI | Bun |
+| External deps | FastAPI, Pydantic, httpx, tiktoken, etc. | Zero |
+| Provider count | 11 (NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI) | 1 (generic OpenAI-compatible endpoint) |
+| Model Router | Opus/Sonnet/Haiku multi-provider routing | None (single upstream) |
+| Configuration | Environment variables | CLI startup arguments |
+| Downstream auth | None | AUTH_TOKEN verification |
+| Executable | None | bun build --compile single file |
+| Containerization | None | Dockerfile (distroless) |
+| Request dump | None | --dump sequential directories |
+| Admin UI | Local web configuration UI | None |
+| Request optimization | quota mock / title skip / prefix detection / filepath mock | None |
+| Discord/Telegram Bot | Full bot integration | None |
+| Web Server Tools | Proxy-side web_search / web_fetch | None |
+| Rate Limiting | Token bucket rate limiting | None |
+| Token counting | tiktoken (cl100k_base) | char/4 estimation |
+| Logging/tracing | loguru + structured trace | console + optional dump |
 
 ## License
 
