@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+*.log
+chat-to-claude-code
+chat-to-claude-code.exe
+.git/
+.claude/
