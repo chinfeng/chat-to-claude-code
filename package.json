@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/server/index.ts",
+    "build": "bun build src/server/index.ts --compile --outfile chat-to-claude-code",
     "test": "bun test",
     "dev": "bun --watch src/server/index.ts"
   },

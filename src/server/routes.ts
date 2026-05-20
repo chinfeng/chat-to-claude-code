@@ -8,11 +8,23 @@ import { invalidRequestError, authenticationError, upstreamError, serverError } 
 import type { ServerConfig } from "./config.js";
 import { ANTHROPIC_SSE_RESPONSE_HEADERS } from "../sse/builder.js";
 
+/** Whether passthrough mode is active: no upstream key and no downstream auth token. */
+function isPassthroughMode(config: ServerConfig): boolean {
+  return !config.upstreamApiKey && !config.authToken;
+}
+
+/** Validate downstream auth token when AUTH_TOKEN is configured. */
+function validateAuthToken(request: Request, config: ServerConfig): boolean {
+  if (!config.authToken) return true;
+  const clientKey = request.headers.get("x-api-key") || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+  return clientKey === config.authToken;
+}
+
 /** Resolve the API key: passthrough from client header, or server config. */
 function resolveApiKey(request: Request, config: ServerConfig): string | null {
   const clientKey = request.headers.get("x-api-key") || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  if (config.enableApiKeyPassthrough && clientKey) return clientKey;
-  if (config.apiKey) return config.apiKey;
+  if (isPassthroughMode(config) && clientKey) return clientKey;
+  if (config.upstreamApiKey) return config.upstreamApiKey;
   return null;
 }
 
@@ -105,9 +117,15 @@ async function* iterUpstreamChunks(
 
 /** Handle POST /v1/messages. */
 export async function handleMessages(request: Request, config: ServerConfig): Promise<Response> {
+  // Validate downstream auth token when configured
+  if (!validateAuthToken(request, config)) {
+    const err = authenticationError("Invalid auth token. Provide correct x-api-key header.");
+    return Response.json(err.json, { status: err.status });
+  }
+
   const apiKey = resolveApiKey(request, config);
   if (!apiKey) {
-    const err = authenticationError("No API key provided. Set API_KEY env var or enable passthrough mode.");
+    const err = authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token).");
     return Response.json(err.json, { status: err.status });
   }
 

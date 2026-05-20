@@ -29,7 +29,10 @@ const server = Bun.serve({
   },
 });
 
+const passthrough = !config.upstreamApiKey && !config.authToken;
 console.log(`chat-to-claude-code listening on http://localhost:${server.port}`);
 console.log(`  Upstream: ${config.upstreamBaseUrl}`);
-console.log(`  API key passthrough: ${config.enableApiKeyPassthrough}`);
+console.log(`  Upstream API key: ${config.upstreamApiKey ? "configured" : "not set"}`);
+console.log(`  Auth token: ${config.authToken ? "configured" : "not set"}`);
+console.log(`  Passthrough mode: ${passthrough}`);
 console.log(`  Thinking: ${config.enableThinking}`);
