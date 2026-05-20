@@ -1,0 +1,10 @@
+{
+  "name": "free-claude-code-bun",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/server/index.ts",
+    "test": "bun test",
+    "dev": "bun --watch src/server/index.ts"
+  }
+}
