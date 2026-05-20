@@ -3,44 +3,41 @@ import { loadConfig } from "../src/server/config.js";
 
 describe("loadConfig", () => {
   it("loads default config values", () => {
-    // Clear relevant env vars for clean test
-    const orig: Record<string, string | undefined> = {};
-    const keys = ["UPSTREAM_BASE_URL", "API_KEY", "ENABLE_API_KEY_PASSTHROUGH", "PORT", "ENABLE_THINKING", "DEFAULT_MODEL"];
-    for (const k of keys) {
-      orig[k] = process.env[k];
-      delete process.env[k];
-    }
+    // Override argv to simulate no args
+    const origArgv = Bun.argv;
+    Bun.argv = ["bun", "run", "src/server/index.ts"];
 
     const config = loadConfig();
     expect(config.upstreamBaseUrl).toBe("https://api.openai.com/v1");
-    expect(config.apiKey).toBe("");
-    expect(config.enableApiKeyPassthrough).toBe(true);
+    expect(config.upstreamApiKey).toBe("");
+    expect(config.authToken).toBe("");
     expect(config.port).toBe(8082);
     expect(config.enableThinking).toBe(true);
-    expect(config.defaultModel).toBe("gpt-4o");
+    expect(config.dumpDir).toBe("");
 
-    // Restore
-    for (const k of keys) {
-      if (orig[k] !== undefined) process.env[k] = orig[k];
-    }
+    Bun.argv = origArgv;
   });
 
-  it("reads from environment variables", () => {
-    process.env.UPSTREAM_BASE_URL = "https://custom.api/v1";
-    process.env.API_KEY = "sk-test";
-    process.env.PORT = "9090";
-    process.env.DEFAULT_MODEL = "claude-3";
+  it("reads CLI arguments", () => {
+    const origArgv = Bun.argv;
+    Bun.argv = [
+      "bun", "run", "src/server/index.ts",
+      "--upstream-base-url", "https://custom.api/v1",
+      "--upstream-api-key", "sk-test",
+      "--auth-token", "my-token",
+      "--port", "9090",
+      "--no-enable-thinking",
+      "--dump", "/tmp/dumps",
+    ];
 
     const config = loadConfig();
     expect(config.upstreamBaseUrl).toBe("https://custom.api/v1");
-    expect(config.apiKey).toBe("sk-test");
+    expect(config.upstreamApiKey).toBe("sk-test");
+    expect(config.authToken).toBe("my-token");
     expect(config.port).toBe(9090);
-    expect(config.defaultModel).toBe("claude-3");
+    expect(config.enableThinking).toBe(false);
+    expect(config.dumpDir).toBe("/tmp/dumps");
 
-    // Clean up
-    delete process.env.UPSTREAM_BASE_URL;
-    delete process.env.API_KEY;
-    delete process.env.PORT;
-    delete process.env.DEFAULT_MODEL;
+    Bun.argv = origArgv;
   });
 });

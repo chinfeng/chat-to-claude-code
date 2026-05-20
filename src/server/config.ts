@@ -6,6 +6,7 @@ export interface ServerConfig {
   authToken: string;
   port: number;
   enableThinking: boolean;
+  dumpDir: string;
 }
 
 function parseArgs(): ServerConfig {
@@ -37,6 +38,7 @@ function parseArgs(): ServerConfig {
     authToken: getArg("auth-token", ""),
     port: parseInt(getArg("port", "8082"), 10),
     enableThinking: getBool("enable-thinking", true),
+    dumpDir: getArg("dump", ""),
   };
 }
 

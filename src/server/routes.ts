@@ -7,6 +7,7 @@ import { estimateInputTokens } from "../core/tokens.js";
 import { invalidRequestError, authenticationError, upstreamError, serverError } from "../core/errors.js";
 import type { ServerConfig } from "./config.js";
 import { ANTHROPIC_SSE_RESPONSE_HEADERS } from "../sse/builder.js";
+import { createDumpSession } from "../core/dump.js";
 
 /** Whether passthrough mode is active: no upstream key and no downstream auth token. */
 function isPassthroughMode(config: ServerConfig): boolean {
@@ -117,15 +118,21 @@ async function* iterUpstreamChunks(
 
 /** Handle POST /v1/messages. */
 export async function handleMessages(request: Request, config: ServerConfig): Promise<Response> {
+  const dump = createDumpSession(config.dumpDir);
+
   // Validate downstream auth token when configured
   if (!validateAuthToken(request, config)) {
     const err = authenticationError("Invalid auth token. Provide correct x-api-key header.");
+    dump.writeResponse(JSON.stringify(err.json));
+    dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
   const apiKey = resolveApiKey(request, config);
   if (!apiKey) {
     const err = authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token).");
+    dump.writeResponse(JSON.stringify(err.json));
+    dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
@@ -134,11 +141,17 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     body = await request.json();
   } catch {
     const err = invalidRequestError("Invalid JSON in request body.");
+    dump.writeResponse(JSON.stringify(err.json));
+    dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
+  dump.writeRequest(JSON.stringify(body, null, 2));
+
   const parsed = parseMessagesBody(body);
   if ("error" in parsed && parsed.error) {
+    dump.writeResponse(JSON.stringify(parsed.error.json));
+    dump.finish();
     return Response.json(parsed.error.json, { status: parsed.error.status });
   }
 
@@ -152,6 +165,8 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const err = upstreamError(`Failed to connect to upstream: ${msg}`, 502);
+    dump.writeResponse(JSON.stringify(err.json));
+    dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
@@ -161,12 +176,16 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
       `Upstream returned ${upstreamRes.status}: ${errBody.slice(0, 500)}`,
       upstreamRes.status >= 500 ? 502 : upstreamRes.status,
     );
+    dump.writeResponse(JSON.stringify(err.json));
+    dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
   const upstreamBody = upstreamRes.body;
   if (!upstreamBody) {
     const err = serverError("Upstream returned empty body.");
+    dump.writeResponse(JSON.stringify(err.json));
+    dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
@@ -179,22 +198,32 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     config.enableThinking,
   );
 
+  const responseChunks: string[] = [];
+
   const readable = new ReadableStream({
     async pull(controller) {
       try {
         const { value, done } = await sseEvents.next();
         if (done) {
+          dump.writeResponse(responseChunks.join(""));
+          dump.finish();
           controller.close();
           return;
         }
+        responseChunks.push(value as string);
         controller.enqueue(new TextEncoder().encode(value));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        controller.enqueue(new TextEncoder().encode(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`));
+        const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
+        dump.writeResponse(responseChunks.join("") + errLine);
+        dump.finish();
+        controller.enqueue(new TextEncoder().encode(errLine));
         controller.close();
       }
     },
     async cancel() {
+      dump.writeResponse(responseChunks.join(""));
+      dump.finish();
       reader.cancel().catch(() => {});
     },
   });

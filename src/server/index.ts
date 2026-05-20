@@ -36,3 +36,4 @@ console.log(`  Upstream API key: ${config.upstreamApiKey ? "configured" : "not s
 console.log(`  Auth token: ${config.authToken ? "configured" : "not set"}`);
 console.log(`  Passthrough mode: ${passthrough}`);
 console.log(`  Thinking: ${config.enableThinking}`);
+console.log(`  Dump: ${config.dumpDir || "disabled"}`);
