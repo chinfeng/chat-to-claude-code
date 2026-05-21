@@ -199,15 +199,24 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   const requestData = parsed.data;
   const inputTokens = estimateInputTokens(requestData.messages);
 
+  // Forward the client's abort signal so fetch() is cancelled when the
+  // downstream client disconnects mid-request — otherwise fetch() hangs
+  // indefinitely and dump.finish() is never called.  Must pass signal
+  // via the second argument of fetch() because Bun does not propagate
+  // Request.signal through fetch(request) to the init layer.
+  const abortSignal = request.signal;
   const upstreamReq = buildUpstreamRequest(requestData, apiKey, config);
   let upstreamRes: Response;
   let ttfb: number | undefined;
   try {
-    upstreamRes = await fetch(upstreamReq);
+    upstreamRes = await fetch(upstreamReq, { signal: abortSignal });
     ttfb = Date.now() - requestStartMs;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    const err = upstreamError(`Failed to connect to upstream: ${msg}`, 502);
+    const isAbort = abortSignal?.aborted || (e instanceof DOMException && e.name === "AbortError");
+    const err = isAbort
+      ? upstreamError(`Client disconnected before upstream responded: ${msg}`, 499)
+      : upstreamError(`Failed to connect to upstream: ${msg}`, 502);
     dump.finish();
     return Response.json(err.json, { status: err.status });
   }
@@ -301,22 +310,24 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
       // only message_start (output_tokens=1).
       (async () => {
         try {
-          for await (const event of sseEvents) {
-            if (downstreamAborted) break;
-            downstreamChunks.push(event as string);
-            controller.enqueue(encoder.encode(event));
+          try {
+            for await (const event of sseEvents) {
+              if (downstreamAborted) break;
+              downstreamChunks.push(event as string);
+              controller.enqueue(encoder.encode(event));
+            }
+          } catch (e) {
+            if (!downstreamAborted) {
+              const msg = e instanceof Error ? e.message : String(e);
+              const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
+              downstreamChunks.push(errLine);
+              try { controller.enqueue(encoder.encode(errLine)); } catch { /* stream already closed */ }
+            }
           }
-        } catch (e) {
-          if (!downstreamAborted) {
-            const msg = e instanceof Error ? e.message : String(e);
-            const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
-            downstreamChunks.push(errLine);
-            controller.enqueue(encoder.encode(errLine));
-          }
+        } finally {
+          finalizeDump();
+          try { controller.close(); } catch { /* already closed by cancel */ }
         }
-
-        finalizeDump();
-        try { controller.close(); } catch { /* already closed by cancel */ }
       })();
     },
     cancel() {

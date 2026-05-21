@@ -535,4 +535,115 @@ describe("SSE stream forwarding", () => {
     // Downstream should NOT contain message_stop since we aborted early
     expect(partial).not.toContain("event: message_stop");
   });
+
+  // -----------------------------------------------------------------------
+  // Bug 6: abort signal forwarded to fetch() — when client disconnects
+  // before upstream responds, fetch() is cancelled (not left hanging)
+  // and dump is finalized
+  // -----------------------------------------------------------------------
+
+  it("forwards request abort signal to upstream fetch()", async () => {
+    // Mock fetch that hangs until aborted — captures the signal passed to it
+    let capturedSignal: AbortSignal | undefined;
+    let fetchRejected = false;
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const sig = init?.signal;
+      if (sig) capturedSignal = sig;
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) {
+          fetchRejected = true;
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+          return;
+        }
+        signal?.addEventListener("abort", () => {
+          fetchRejected = true;
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        }, { once: true });
+      });
+    }) as typeof fetch;
+
+    const controller = new AbortController();
+    const req = new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": "test-key",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 1024,
+      }),
+      signal: controller.signal,
+    });
+
+    // Start routeRequest without awaiting — it will block at fetch()
+    const responsePromise = routeRequest(req, TEST_CONFIG);
+
+    // Yield enough for the handler to reach the fetch() call
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Abort the client connection
+    controller.abort();
+
+    // Now routeRequest should resolve (with 499 error)
+    const res = await responsePromise;
+    expect(res.status).toBe(499);
+
+    // Verify the abort signal was actually forwarded to fetch()
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal!.aborted).toBe(true);
+    expect(fetchRejected).toBe(true);
+  });
+
+  // -----------------------------------------------------------------------
+  // Bug 7: finalizeDump always runs — even when upstream errors mid-
+  // stream, the dump directory is renamed with START/END timestamps
+  // -----------------------------------------------------------------------
+
+  it("finalizes dump directory when upstream errors mid-stream", async () => {
+    const goodPrefix = sseData({
+      id: "chatcmpl-dump-finalize",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "gpt-4o",
+      choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }],
+    });
+
+    mockFetchWithMidStreamError(goodPrefix, "Connection reset by peer");
+
+    const tmpDir = `${import.meta.dir}/.test-dump-finalize-${Date.now()}`;
+    const configWithDump: ServerConfig = {
+      ...TEST_CONFIG,
+      dumpDir: tmpDir,
+    };
+
+    try {
+      const res = await routeRequest(makeMessagesRequest(), configWithDump);
+      expect(res.status).toBe(200);
+
+      // Read the full response — the upstream error should appear as an
+      // SSE error event, and finalizeDump should have been called
+      const body = await collectResponseBody(res);
+      expect(body).toContain("Upstream stream read error");
+
+      // Verify dump was finalized: directory renamed with __START_ and __END_
+      const { readdirSync } = await import("node:fs");
+      await new Promise((r) => setTimeout(r, 50));
+      const dirs = readdirSync(tmpDir);
+      expect(dirs.some((d) => d.includes("__START_") && d.includes("__END_"))).toBe(true);
+
+      // Verify the renamed dir contains all expected log files
+      const renamedDir = dirs.find((d) => d.includes("__START_"))!;
+      const { readdirSync: readdir2 } = await import("node:fs");
+      const files = readdir2(`${tmpDir}/${renamedDir}`);
+      expect(files).toContain("request.log");
+      expect(files).toContain("upstream-response.log");
+      expect(files).toContain("downstream-response.log");
+    } finally {
+      const { rmSync } = await import("node:fs");
+      try { rmSync(tmpDir, { recursive: true }); } catch {}
+    }
+  });
 });
