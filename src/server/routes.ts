@@ -105,7 +105,8 @@ function parseSseLine(line: string): unknown | null {
 }
 
 /** Convert an upstream ReadableStream into AsyncIterable of parsed chunks,
- *  while also collecting raw upstream text for dump logging. */
+ * while also collecting raw upstream text for dump logging.
+ * Handles both \n and \r\n line endings from upstream / reverse proxies. */
 async function* iterUpstreamChunks(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   rawChunks?: string[],
@@ -113,28 +114,42 @@ async function* iterUpstreamChunks(
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (true) {
+      let value: Uint8Array | undefined;
+      let done: boolean;
+      try {
+        ({ done, value } = await reader.read());
+      } catch (e) {
+        // Network error or proxy disconnection mid-stream — propagate as error
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(`Upstream stream read error: ${msg}`);
+      }
+      if (done) break;
 
-    const decoded = decoder.decode(value, { stream: true });
-    if (rawChunks) rawChunks.push(decoded);
-    buffer += decoded;
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+      const decoded = decoder.decode(value, { stream: true });
+      if (rawChunks) rawChunks.push(decoded);
+      buffer += decoded;
+      // Split on \n — handles both \n (LF) and \r\n (CRLF) since we .trim() below
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const chunk = parseSseLine(trimmed);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const chunk = parseSseLine(trimmed);
+        if (chunk) yield chunk;
+      }
+    }
+
+    // flush remaining buffer
+    if (buffer.trim()) {
+      const chunk = parseSseLine(buffer.trim());
       if (chunk) yield chunk;
     }
-  }
-
-  // flush remaining buffer
-  if (buffer.trim()) {
-    const chunk = parseSseLine(buffer.trim());
-    if (chunk) yield chunk;
+  } finally {
+    // Always release the reader lock so the stream can be properly cleaned up
+    try { reader.releaseLock(); } catch { /* already released or cancelled */ }
   }
 }
 
@@ -245,6 +260,29 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   );
 
   const downstreamChunks: string[] = [];
+  let downstreamAborted = false;
+  let dumpFinished = false;
+
+  /** Write dump logs and finish. Safe to call from both start() and cancel()
+   * — the finished guard prevents double writes. */
+  function finalizeDump(): void {
+    if (dumpFinished) return;
+    dumpFinished = true;
+    dump.writeUpstreamResponse({
+      headers: upstreamHeaders,
+      status: upstreamStatus,
+      body: rawUpstreamChunks.join(""),
+    });
+    dump.writeDownstreamResponse({
+      headers: downstreamHeaders,
+      status: 200,
+      body: downstreamChunks.join(""),
+    });
+    if (ttfb !== undefined) {
+      dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
+    }
+    dump.finish();
+  }
 
   const downstreamHeaders: Record<string, string> = {
     "Content-Type": "text/event-stream",
@@ -252,83 +290,28 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   };
 
   const readable = new ReadableStream({
-    async pull(controller) {
+    async start(controller) {
       try {
-        const { value, done } = await sseEvents.next();
-        if (done) {
-          // Log upstream raw response
-          dump.writeUpstreamResponse({
-            headers: upstreamHeaders,
-            status: upstreamStatus,
-            body: rawUpstreamChunks.join(""),
-          });
-
-          // Log downstream transformed response
-          const downstreamBody = downstreamChunks.join("");
-          dump.writeDownstreamResponse({
-            headers: downstreamHeaders,
-            status: 200,
-            body: downstreamBody,
-          });
-
-          // Set timing
-          if (ttfb !== undefined) {
-            dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
-          }
-
-          dump.finish();
-          controller.close();
-          return;
+        for await (const event of sseEvents) {
+          if (downstreamAborted) break;
+          downstreamChunks.push(event as string);
+          controller.enqueue(new TextEncoder().encode(event));
         }
-        downstreamChunks.push(value as string);
-        controller.enqueue(new TextEncoder().encode(value));
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
-
-        // Log upstream raw response
-        dump.writeUpstreamResponse({
-          headers: upstreamHeaders,
-          status: upstreamStatus,
-          body: rawUpstreamChunks.join(""),
-        });
-
-        // Log downstream response including error
-        const downstreamBody = downstreamChunks.join("") + errLine;
-        dump.writeDownstreamResponse({
-          headers: downstreamHeaders,
-          status: 200,
-          body: downstreamBody,
-        });
-
-        if (ttfb !== undefined) {
-          dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
+        if (!downstreamAborted) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
+          downstreamChunks.push(errLine);
+          controller.enqueue(new TextEncoder().encode(errLine));
         }
-
-        dump.finish();
-        controller.enqueue(new TextEncoder().encode(errLine));
-        controller.close();
       }
+
+      finalizeDump();
+      try { controller.close(); } catch { /* already closed by cancel */ }
     },
-    async cancel() {
-      // Log whatever we have so far
-      dump.writeUpstreamResponse({
-        headers: upstreamHeaders,
-        status: upstreamStatus,
-        body: rawUpstreamChunks.join(""),
-      });
-
-      dump.writeDownstreamResponse({
-        headers: downstreamHeaders,
-        status: 200,
-        body: downstreamChunks.join(""),
-      });
-
-      if (ttfb !== undefined) {
-        dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
-      }
-
-      dump.finish();
+    cancel() {
+      downstreamAborted = true;
+      finalizeDump();
       reader.cancel().catch(() => {});
     },
   });
