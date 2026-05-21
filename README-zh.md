@@ -10,6 +10,43 @@
 - 无内置路由状态，进程无状态，随起随停
 - 可独立扩缩容、滚动升级，互不影响
 
+## 项目动机
+
+受 [free-claude-code](https://github.com/Alishahryar1/free-claude-code) 启发，本项目旨在提供一个**更轻量的部署方案**：
+
+- **更小占用** — 纯 Bun 运行时，零 npm 依赖，磁盘和内存占用远低于 Python + FastAPI 方案
+- **简化路由** — 完全去掉多上游转发，仅保留单上游的 OpenAI→Anthropic 协议中转
+- **透传友好** — 支持 auth_token 透传，无需硬编码上游密钥，适合部署在极轻量服务器（如 1C1G）上
+- **多进程扩展** — 需要多个上游时，只需每个上游启动一个进程，监听不同端口，由反向代理或 DNS 做路由分发
+
+### 多上游部署示例
+
+```bash
+# 进程 1：NVIDIA NIM，监听 8082 端口
+bun run src/server/index.ts \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx \
+  --port 8082
+
+# 进程 2：OpenRouter，监听 8083 端口
+bun run src/server/index.ts \
+  --upstream-base-url https://openrouter.ai/api/v1 \
+  --upstream-api-key sk-or-xxxx \
+  --port 8083
+```
+
+然后将 Claude Code 指向所需的上游：
+
+```bash
+# 使用 NVIDIA NIM
+ANTHROPIC_BASE_URL=http://localhost:8082 claude
+
+# 使用 OpenRouter
+ANTHROPIC_BASE_URL=http://localhost:8083 claude
+```
+
+或者将两个进程置于反向代理（nginx、Caddy 等）之后，按域名或路径做路由分发。
+
 ## 工作原理
 
 ```

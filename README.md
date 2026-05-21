@@ -12,6 +12,43 @@ This project follows the Unix philosophy: **one process, one upstream endpoint**
 - No built-in routing state — processes are stateless, start and stop at will
 - Independent scaling and rolling upgrades without cross-contamination
 
+## Motivation
+
+Inspired by [free-claude-code](https://github.com/Alishahryar1/free-claude-code), this project was created to provide a **lighter-weight alternative** for deployment:
+
+- **Smaller footprint** — Pure Bun runtime with zero npm dependencies, consuming less disk space and memory than a Python + FastAPI stack
+- **Simplified routing** — Multi-upstream forwarding is removed entirely; only single-upstream OpenAI-to-Anthropic protocol translation remains
+- **Passthrough-friendly** — Auth token passthrough allows deploying on minimal servers (e.g. 1 vCPU / 1 GB RAM) without hardcoding upstream keys
+- **Multi-process scaling** — When multiple upstreams are needed, simply run one process per upstream on different ports, and let a reverse proxy or DNS route traffic
+
+### Multi-Upstream Example
+
+```bash
+# Process 1: NVIDIA NIM on port 8082
+bun run src/server/index.ts \
+  --upstream-base-url https://integrate.api.nvidia.com/v1 \
+  --upstream-api-key nvapi-xxxx \
+  --port 8082
+
+# Process 2: OpenRouter on port 8083
+bun run src/server/index.ts \
+  --upstream-base-url https://openrouter.ai/api/v1 \
+  --upstream-api-key sk-or-xxxx \
+  --port 8083
+```
+
+Then point Claude Code to the desired upstream:
+
+```bash
+# Use NVIDIA NIM
+ANTHROPIC_BASE_URL=http://localhost:8082 claude
+
+# Use OpenRouter
+ANTHROPIC_BASE_URL=http://localhost:8083 claude
+```
+
+Or place both behind a reverse proxy (nginx, Caddy, etc.) and route by domain or path.
+
 ## How It Works
 
 ```
