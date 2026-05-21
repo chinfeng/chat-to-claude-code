@@ -29,6 +29,24 @@ function resolveApiKey(request: Request, config: ServerConfig): string | null {
   return null;
 }
 
+/** Extract request headers as a plain object for dump logging. */
+function extractRequestHeaders(request: Request): Record<string, string> {
+  const headers: Record<string, string> = {};
+  request.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  return headers;
+}
+
+/** Extract response headers as a plain object for dump logging. */
+function extractResponseHeaders(response: Response): Record<string, string> {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  return headers;
+}
+
 /** Parse and validate the Anthropic /v1/messages request body. */
 function parseMessagesBody(body: unknown): { data: RequestData; error?: never } | { data?: never; error: { json: unknown; status: number } } {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -86,9 +104,11 @@ function parseSseLine(line: string): unknown | null {
   }
 }
 
-/** Convert an upstream ReadableStream into AsyncIterable of parsed chunks. */
+/** Convert an upstream ReadableStream into AsyncIterable of parsed chunks,
+ *  while also collecting raw upstream text for dump logging. */
 async function* iterUpstreamChunks(
   reader: ReadableStreamDefaultReader<Uint8Array>,
+  rawChunks?: string[],
 ): AsyncGenerator<unknown> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -97,7 +117,9 @@ async function* iterUpstreamChunks(
     const { done, value } = await reader.read();
     if (done) break;
 
-    buffer += decoder.decode(value, { stream: true });
+    const decoded = decoder.decode(value, { stream: true });
+    if (rawChunks) rawChunks.push(decoded);
+    buffer += decoded;
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
 
@@ -119,11 +141,12 @@ async function* iterUpstreamChunks(
 /** Handle POST /v1/messages. */
 export async function handleMessages(request: Request, config: ServerConfig): Promise<Response> {
   const dump = createDumpSession(config.dumpDir);
+  const requestStartMs = Date.now();
+  const requestDatetime = new Date().toISOString();
 
   // Validate downstream auth token when configured
   if (!validateAuthToken(request, config)) {
     const err = authenticationError("Invalid auth token. Provide correct x-api-key header.");
-    dump.writeResponse(JSON.stringify(err.json));
     dump.finish();
     return Response.json(err.json, { status: err.status });
   }
@@ -131,7 +154,6 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   const apiKey = resolveApiKey(request, config);
   if (!apiKey) {
     const err = authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token).");
-    dump.writeResponse(JSON.stringify(err.json));
     dump.finish();
     return Response.json(err.json, { status: err.status });
   }
@@ -141,16 +163,20 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     body = await request.json();
   } catch {
     const err = invalidRequestError("Invalid JSON in request body.");
-    dump.writeResponse(JSON.stringify(err.json));
     dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
-  dump.writeRequest(JSON.stringify(body, null, 2));
+  // Log downstream request with headers and datetime
+  const requestHeaders = extractRequestHeaders(request);
+  dump.writeRequest({
+    headers: requestHeaders,
+    datetime: requestDatetime,
+    body: JSON.stringify(body, null, 2),
+  });
 
   const parsed = parseMessagesBody(body);
   if ("error" in parsed && parsed.error) {
-    dump.writeResponse(JSON.stringify(parsed.error.json));
     dump.finish();
     return Response.json(parsed.error.json, { status: parsed.error.status });
   }
@@ -160,37 +186,57 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
 
   const upstreamReq = buildUpstreamRequest(requestData, apiKey, config);
   let upstreamRes: Response;
+  let ttfb: number | undefined;
   try {
     upstreamRes = await fetch(upstreamReq);
+    ttfb = Date.now() - requestStartMs;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const err = upstreamError(`Failed to connect to upstream: ${msg}`, 502);
-    dump.writeResponse(JSON.stringify(err.json));
     dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
+  // Log upstream response headers and status
+  const upstreamHeaders = extractResponseHeaders(upstreamRes);
+  const upstreamStatus = upstreamRes.status;
+
   if (!upstreamRes.ok) {
     const errBody = await upstreamRes.text().catch(() => "");
+    dump.writeUpstreamResponse({
+      headers: upstreamHeaders,
+      status: upstreamStatus,
+      body: errBody,
+    });
+    if (ttfb !== undefined) {
+      dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
+    }
+    dump.finish();
     const err = upstreamError(
       `Upstream returned ${upstreamRes.status}: ${errBody.slice(0, 500)}`,
       upstreamRes.status >= 500 ? 502 : upstreamRes.status,
     );
-    dump.writeResponse(JSON.stringify(err.json));
-    dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
   const upstreamBody = upstreamRes.body;
   if (!upstreamBody) {
-    const err = serverError("Upstream returned empty body.");
-    dump.writeResponse(JSON.stringify(err.json));
+    dump.writeUpstreamResponse({
+      headers: upstreamHeaders,
+      status: upstreamStatus,
+      body: "",
+    });
+    if (ttfb !== undefined) {
+      dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
+    }
     dump.finish();
+    const err = serverError("Upstream returned empty body.");
     return Response.json(err.json, { status: err.status });
   }
 
   const reader = upstreamBody.getReader();
-  const chunks = iterUpstreamChunks(reader);
+  const rawUpstreamChunks: string[] = [];
+  const chunks = iterUpstreamChunks(reader, rawUpstreamChunks);
   const sseEvents = streamOpenAIChatToAnthropicSse(
     chunks as AsyncIterable<import("../transport/stream.js").StreamChunk>,
     requestData,
@@ -198,31 +244,90 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     config.enableThinking,
   );
 
-  const responseChunks: string[] = [];
+  const downstreamChunks: string[] = [];
+
+  const downstreamHeaders: Record<string, string> = {
+    "Content-Type": "text/event-stream",
+    ...ANTHROPIC_SSE_RESPONSE_HEADERS,
+  };
 
   const readable = new ReadableStream({
     async pull(controller) {
       try {
         const { value, done } = await sseEvents.next();
         if (done) {
-          dump.writeResponse(responseChunks.join(""));
+          // Log upstream raw response
+          dump.writeUpstreamResponse({
+            headers: upstreamHeaders,
+            status: upstreamStatus,
+            body: rawUpstreamChunks.join(""),
+          });
+
+          // Log downstream transformed response
+          const downstreamBody = downstreamChunks.join("");
+          dump.writeDownstreamResponse({
+            headers: downstreamHeaders,
+            status: 200,
+            body: downstreamBody,
+          });
+
+          // Set timing
+          if (ttfb !== undefined) {
+            dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
+          }
+
           dump.finish();
           controller.close();
           return;
         }
-        responseChunks.push(value as string);
+        downstreamChunks.push(value as string);
         controller.enqueue(new TextEncoder().encode(value));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
-        dump.writeResponse(responseChunks.join("") + errLine);
+
+        // Log upstream raw response
+        dump.writeUpstreamResponse({
+          headers: upstreamHeaders,
+          status: upstreamStatus,
+          body: rawUpstreamChunks.join(""),
+        });
+
+        // Log downstream response including error
+        const downstreamBody = downstreamChunks.join("") + errLine;
+        dump.writeDownstreamResponse({
+          headers: downstreamHeaders,
+          status: 200,
+          body: downstreamBody,
+        });
+
+        if (ttfb !== undefined) {
+          dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
+        }
+
         dump.finish();
         controller.enqueue(new TextEncoder().encode(errLine));
         controller.close();
       }
     },
     async cancel() {
-      dump.writeResponse(responseChunks.join(""));
+      // Log whatever we have so far
+      dump.writeUpstreamResponse({
+        headers: upstreamHeaders,
+        status: upstreamStatus,
+        body: rawUpstreamChunks.join(""),
+      });
+
+      dump.writeDownstreamResponse({
+        headers: downstreamHeaders,
+        status: 200,
+        body: downstreamChunks.join(""),
+      });
+
+      if (ttfb !== undefined) {
+        dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
+      }
+
       dump.finish();
       reader.cancel().catch(() => {});
     },
@@ -230,10 +335,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
 
   return new Response(readable, {
     status: 200,
-    headers: {
-      "Content-Type": "text/event-stream",
-      ...ANTHROPIC_SSE_RESPONSE_HEADERS,
-    },
+    headers: downstreamHeaders,
   });
 }
 
