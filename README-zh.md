@@ -286,8 +286,6 @@ src/
 │   └── builder.ts         # Anthropic SSE 事件构建器
 ├── transport/
 │   └── stream.ts          # OpenAI 流 → Anthropic SSE 流式转换
-└── utils/
-    └── helpers.ts         # 通用工具函数
 ```
 
 ### 运行测试

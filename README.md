@@ -288,8 +288,6 @@ src/
 │   └── builder.ts         # Anthropic SSE event builder
 ├── transport/
 │   └── stream.ts          # OpenAI stream → Anthropic SSE stream converter
-└── utils/
-    └── helpers.ts         # General utility functions
 ```
 
 ### Run Tests
