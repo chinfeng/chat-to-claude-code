@@ -7,6 +7,7 @@ const config = loadConfig();
 
 const server = Bun.serve({
   port: config.port,
+  idleTimeout: 0, // Disable idle timeout to allow long-running requests
   async fetch(request: Request): Promise<Response> {
     // CORS preflight
     if (request.method === "OPTIONS") {
