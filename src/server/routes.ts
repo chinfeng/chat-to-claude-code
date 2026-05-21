@@ -289,25 +289,35 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     ...ANTHROPIC_SSE_RESPONSE_HEADERS,
   };
 
+  const encoder = new TextEncoder();
   const readable = new ReadableStream({
     async start(controller) {
-      try {
-        for await (const event of sseEvents) {
-          if (downstreamAborted) break;
-          downstreamChunks.push(event as string);
-          controller.enqueue(new TextEncoder().encode(event));
+      // Fire-and-forget: start the SSE pump AFTER start() resolves so the
+      // stream is "started" and the controller respects backpressure from
+      // downstream pulls. Running the for-await loop directly inside
+      // start() causes all enqueue()s to fire before the stream signals
+      // readiness — the internal highWaterMark saturates and further
+      // events are silently dropped, leaving the downstream client with
+      // only message_start (output_tokens=1).
+      (async () => {
+        try {
+          for await (const event of sseEvents) {
+            if (downstreamAborted) break;
+            downstreamChunks.push(event as string);
+            controller.enqueue(encoder.encode(event));
+          }
+        } catch (e) {
+          if (!downstreamAborted) {
+            const msg = e instanceof Error ? e.message : String(e);
+            const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
+            downstreamChunks.push(errLine);
+            controller.enqueue(encoder.encode(errLine));
+          }
         }
-      } catch (e) {
-        if (!downstreamAborted) {
-          const msg = e instanceof Error ? e.message : String(e);
-          const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
-          downstreamChunks.push(errLine);
-          controller.enqueue(new TextEncoder().encode(errLine));
-        }
-      }
 
-      finalizeDump();
-      try { controller.close(); } catch { /* already closed by cancel */ }
+        finalizeDump();
+        try { controller.close(); } catch { /* already closed by cancel */ }
+      })();
     },
     cancel() {
       downstreamAborted = true;
