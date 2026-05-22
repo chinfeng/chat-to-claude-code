@@ -9,16 +9,30 @@ export interface DumpRequestMeta {
   body: string;
 }
 
+export type TerminationReason =
+  | "completed"
+  | "client_abort"
+  | "upstream_timeout"
+  | "upstream_error"
+  | "upstream_abort";
+
+export interface DumpTermination {
+  reason: TerminationReason;
+  disconnectTime?: string;
+}
+
 export interface DumpUpstreamResponseMeta {
   headers: Record<string, string>;
   status: number;
   body: string;
+  termination?: DumpTermination;
 }
 
 export interface DumpDownstreamResponseMeta {
   headers: Record<string, string>;
   status: number;
   body: string;
+  termination?: DumpTermination;
 }
 
 export interface DumpTiming {
@@ -66,6 +80,12 @@ function formatRequestLog(meta: DumpRequestMeta): string {
   return out;
 }
 
+function formatTermination(t: DumpTermination): string {
+  let out = `Reason: ${t.reason}`;
+  if (t.disconnectTime) out += `\nDisconnectTime: ${t.disconnectTime}`;
+  return out;
+}
+
 function formatResponseLog(
   meta: DumpUpstreamResponseMeta | DumpDownstreamResponseMeta,
   timing?: DumpTiming,
@@ -74,6 +94,9 @@ function formatResponseLog(
   out += formatSection("Response Status", String(meta.status));
   out += formatSection("Response Headers", formatHeaders(meta.headers));
   out += formatSection("Response Body", meta.body);
+  if (meta.termination) {
+    out += formatSection("Termination", formatTermination(meta.termination));
+  }
   if (timing) {
     out += formatSection("Timing", `TTFB: ${timing.ttfb}ms\nTotal: ${timing.totalTime}ms`);
   }

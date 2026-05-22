@@ -7,7 +7,7 @@ import { estimateInputTokens } from "../core/tokens.js";
 import { invalidRequestError, authenticationError, upstreamError, serverError } from "../core/errors.js";
 import type { ServerConfig } from "./config.js";
 import { ANTHROPIC_SSE_RESPONSE_HEADERS } from "../sse/builder.js";
-import { createDumpSession } from "../core/dump.js";
+import { createDumpSession, type DumpTermination, type TerminationReason } from "../core/dump.js";
 
 /** Whether passthrough mode is active: no upstream key and no downstream auth token. */
 function isPassthroughMode(config: ServerConfig): boolean {
@@ -214,6 +214,19 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const isAbort = abortSignal?.aborted || (e instanceof DOMException && e.name === "AbortError");
+    const disconnectTime = new Date().toISOString();
+    const termination: DumpTermination = isAbort
+      ? { reason: "client_abort", disconnectTime }
+      : { reason: "upstream_timeout", disconnectTime };
+    dump.writeUpstreamResponse({ headers: {}, status: 0, body: "", termination });
+    dump.writeDownstreamResponse({
+      headers: {},
+      status: isAbort ? 499 : 502,
+      body: JSON.stringify(isAbort
+        ? upstreamError(`Client disconnected before upstream responded: ${msg}`, 499).json
+        : upstreamError(`Failed to connect to upstream: ${msg}`, 502).json),
+      termination,
+    });
     const err = isAbort
       ? upstreamError(`Client disconnected before upstream responded: ${msg}`, 499)
       : upstreamError(`Failed to connect to upstream: ${msg}`, 502);
@@ -227,34 +240,51 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
 
   if (!upstreamRes.ok) {
     const errBody = await upstreamRes.text().catch(() => "");
+    const termination: DumpTermination = { reason: "upstream_error", disconnectTime: new Date().toISOString() };
     dump.writeUpstreamResponse({
       headers: upstreamHeaders,
       status: upstreamStatus,
       body: errBody,
+      termination,
+    });
+    const mappedStatus = upstreamRes.status >= 500 ? 502 : upstreamRes.status;
+    const err = upstreamError(
+      `Upstream returned ${upstreamRes.status}: ${errBody.slice(0, 500)}`,
+      mappedStatus,
+    );
+    dump.writeDownstreamResponse({
+      headers: {},
+      status: mappedStatus,
+      body: JSON.stringify(err.json),
+      termination,
     });
     if (ttfb !== undefined) {
       dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
     }
     dump.finish();
-    const err = upstreamError(
-      `Upstream returned ${upstreamRes.status}: ${errBody.slice(0, 500)}`,
-      upstreamRes.status >= 500 ? 502 : upstreamRes.status,
-    );
     return Response.json(err.json, { status: err.status });
   }
 
   const upstreamBody = upstreamRes.body;
   if (!upstreamBody) {
+    const termination: DumpTermination = { reason: "upstream_error", disconnectTime: new Date().toISOString() };
     dump.writeUpstreamResponse({
       headers: upstreamHeaders,
       status: upstreamStatus,
       body: "",
+      termination,
+    });
+    const err = serverError("Upstream returned empty body.");
+    dump.writeDownstreamResponse({
+      headers: {},
+      status: 500,
+      body: JSON.stringify(err.json),
+      termination,
     });
     if (ttfb !== undefined) {
       dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
     }
     dump.finish();
-    const err = serverError("Upstream returned empty body.");
     return Response.json(err.json, { status: err.status });
   }
 
@@ -271,21 +301,26 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   const downstreamChunks: string[] = [];
   let downstreamAborted = false;
   let dumpFinished = false;
+  let terminationReason: TerminationReason = "completed";
 
   /** Write dump logs and finish. Safe to call from both start() and cancel()
    * — the finished guard prevents double writes. */
   function finalizeDump(): void {
     if (dumpFinished) return;
     dumpFinished = true;
+    const disconnectTime = terminationReason !== "completed" ? new Date().toISOString() : undefined;
+    const termination: DumpTermination = { reason: terminationReason, disconnectTime };
     dump.writeUpstreamResponse({
       headers: upstreamHeaders,
       status: upstreamStatus,
       body: rawUpstreamChunks.join(""),
+      termination,
     });
     dump.writeDownstreamResponse({
       headers: downstreamHeaders,
       status: 200,
       body: downstreamChunks.join(""),
+      termination,
     });
     if (ttfb !== undefined) {
       dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
@@ -318,6 +353,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
             }
           } catch (e) {
             if (!downstreamAborted) {
+              terminationReason = "upstream_abort";
               const msg = e instanceof Error ? e.message : String(e);
               const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
               downstreamChunks.push(errLine);
@@ -332,6 +368,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     },
     cancel() {
       downstreamAborted = true;
+          terminationReason = "client_abort";
       finalizeDump();
       reader.cancel().catch(() => {});
     },
