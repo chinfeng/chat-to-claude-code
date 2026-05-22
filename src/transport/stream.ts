@@ -6,6 +6,16 @@ import { ThinkTagParser, ContentType, HeuristicToolParser } from "../parsers/ind
 import { buildBaseRequestBody, ReasoningReplayMode } from "../conversion/converter.js";
 import type { RequestData } from "../conversion/converter.js";
 
+/** Thrown when the upstream embeds an error object in the SSE stream (HTTP 200 with error payload). */
+export class UpstreamStreamError extends Error {
+  readonly code: number;
+  constructor(message: string, code = 500) {
+    super(message);
+    this.name = "UpstreamStreamError";
+    this.code = code;
+  }
+}
+
 export interface StreamChunk {
   choices?: {
     delta: {
@@ -66,6 +76,17 @@ export async function* streamOpenAIChatToAnthropicSse(
   try {
     for await (const chunk of upstreamStream) {
       if (chunk.usage) usageInfo = chunk.usage;
+
+      // Detect upstream error objects in SSE stream (e.g. {"error":{"message":"...","type":"upstream_error","code":500}})
+      // Some providers return HTTP 200 but embed errors as SSE data chunks.
+      const chunkAny = chunk as Record<string, unknown>;
+      if (chunkAny.error && typeof chunkAny.error === "object" && chunkAny.error !== null) {
+        const err = chunkAny.error as Record<string, unknown>;
+        const message = typeof err.message === "string" ? err.message : JSON.stringify(err);
+        const code = typeof err.code === "number" ? err.code : 500;
+        throw new UpstreamStreamError(message, code);
+      }
+
       if (!chunk.choices?.length) continue;
 
       const choice = chunk.choices[0];
