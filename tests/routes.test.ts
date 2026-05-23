@@ -9,6 +9,7 @@ const TEST_CONFIG: ServerConfig = {
   port: 8082,
   enableThinking: true,
   dumpDir: "",
+  modelOverrides: [],
 };
 
 describe("routeRequest", () => {

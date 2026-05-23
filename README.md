@@ -129,7 +129,31 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--port` | `8082` | HTTP listen port |
 | `--enable-thinking` | `true` | Convert upstream reasoning content to Anthropic thinking blocks |
 | `--no-enable-thinking` | — | Disable thinking conversion |
+| `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
+
+### Model-Specific Extra Parameters
+
+Use `--upstream-extra-params` to inject additional JSON fields into the upstream request body based on the model name. The format is `glob=JSON`:
+
+```bash
+--upstream-extra-params 'claude-*={"thinking":{"type":"enabled","budget_tokens":10000}}'
+```
+
+- **Glob pattern** — `*` matches any characters, `?` matches a single character. The first matching pattern wins.
+- **JSON value** — Must be a JSON object. Deep-merged into the upstream request body (nested objects are merged, arrays are replaced).
+- **Repeatable** — Specify multiple times for different model patterns:
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --upstream-extra-params 'claude-sonnet-*={"thinking":{"type":"enabled","budget_tokens":10000}}' \
+  --upstream-extra-params 'deepseek*={"reasoning_effort":"high"}' \
+  --upstream-extra-params '*={"stream":true}'
+```
+
+When a request arrives with `model: "claude-sonnet-4-20250514"`, the matching `claude-sonnet-*` pattern is selected and its JSON is merged into the upstream request body. The catch-all `*` pattern acts as a default for any unmatched model.
 
 ### Passthrough Mode
 

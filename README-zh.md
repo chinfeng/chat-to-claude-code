@@ -124,7 +124,31 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--port` | `8082` | HTTP 监听端口 |
 | `--enable-thinking` | `true` | 将上游推理内容转为 Anthropic thinking block |
 | `--no-enable-thinking` | — | 禁用 thinking 转换 |
+| `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
+
+### 按模型注入额外参数
+
+使用 `--upstream-extra-params` 根据请求中的模型名向上游请求体注入额外的 JSON 字段。格式为 `glob=JSON`：
+
+```bash
+--upstream-extra-params 'claude-*={"thinking":{"type":"enabled","budget_tokens":10000}}'
+```
+
+- **glob 模式** — `*` 匹配任意字符，`?` 匹配单个字符。第一个匹配的模式生效。
+- **JSON 值** — 必须是 JSON 对象。会深层合并（deep merge）到上游请求体中：嵌套对象逐层合并，数组直接替换。
+- **可重复指定** — 多次使用以配置不同模型：
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --upstream-extra-params 'claude-sonnet-*={"thinking":{"type":"enabled","budget_tokens":10000}}' \
+  --upstream-extra-params 'deepseek*={"reasoning_effort":"high"}' \
+  --upstream-extra-params '*={"stream":true}'
+```
+
+当请求携带 `model: "claude-sonnet-4-20250514"` 到达时，匹配到 `claude-sonnet-*` 模式，其 JSON 会被合并到上游请求体中。`*` 通配符可作为所有未匹配模型的默认规则。
 
 ### 透传模式
 

@@ -151,6 +151,7 @@ const TEST_CONFIG: ServerConfig = {
   port: 8082,
   enableThinking: true,
   dumpDir: "",
+  modelOverrides: [],
 };
 
 function makeMessagesRequest(body?: Partial<Record<string, unknown>>): Request {

@@ -6,6 +6,7 @@ import { streamOpenAIChatToAnthropicSse } from "../transport/stream.js";
 import { estimateInputTokens } from "../core/tokens.js";
 import { invalidRequestError, authenticationError, upstreamError, serverError } from "../core/errors.js";
 import type { ServerConfig } from "./config.js";
+import { resolveModelExtra, deepMerge } from "./config.js";
 import { ANTHROPIC_SSE_RESPONSE_HEADERS } from "../sse/builder.js";
 import { createDumpSession, type DumpTermination, type TerminationReason } from "../core/dump.js";
 
@@ -78,9 +79,14 @@ function parseMessagesBody(body: unknown): { data: RequestData; error?: never } 
 
 /** Build the upstream OpenAI-compatible fetch request. */
 function buildUpstreamRequest(requestData: RequestData, apiKey: string, config: ServerConfig): Request {
-  const body = buildBaseRequestBody(requestData, 4096, ReasoningReplayMode.THINK_TAGS);
+  let body = buildBaseRequestBody(requestData, 4096, ReasoningReplayMode.THINK_TAGS);
   const url = `${config.upstreamBaseUrl.replace(/\/+$/, "")}/chat/completions`;
-  (body as Record<string, unknown>).stream = true;
+  body.stream = true;
+
+  const extra = resolveModelExtra(requestData.model, config.modelOverrides);
+  if (Object.keys(extra).length) {
+    body = deepMerge(body, extra);
+  }
 
   return new Request(url, {
     method: "POST",
