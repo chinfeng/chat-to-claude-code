@@ -107,6 +107,9 @@ chat-to-claude-code listening on http://localhost:8082
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:8082"
 export ANTHROPIC_AUTH_TOKEN="your-token-here"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="deepseek-ai/deepseek-v4-pro"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="qwen/qwen3.5-397b-a17b"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="minimaxai/minimax-m2.7"
 claude
 ```
 
