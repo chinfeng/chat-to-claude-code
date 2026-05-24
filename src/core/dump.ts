@@ -43,7 +43,8 @@ export interface DumpTiming {
 }
 
 export interface DumpSession {
-  writeRequest(meta: DumpRequestMeta): void;
+  writeDownstreamRequest(meta: DumpRequestMeta): void;
+  writeUpstreamRequest(meta: DumpRequestMeta): void;
   writeUpstreamResponse(meta: DumpUpstreamResponseMeta): void;
   writeDownstreamResponse(meta: DumpDownstreamResponseMeta): void;
   setTiming(timing: DumpTiming): void;
@@ -51,7 +52,8 @@ export interface DumpSession {
 }
 
 const noopSession: DumpSession = {
-  writeRequest() {},
+  writeDownstreamRequest() {},
+  writeUpstreamRequest() {},
   writeUpstreamResponse() {},
   writeDownstreamResponse() {},
   setTiming() {},
@@ -117,8 +119,11 @@ export function createDumpSession(dumpDir: string): DumpSession {
   try { mkdirSync(tmpDir, { recursive: true }); } catch {}
 
   return {
-    writeRequest(meta: DumpRequestMeta) {
-      try { writeFileSync(`${tmpDir}/request.log`, formatRequestLog(meta)); } catch {}
+    writeDownstreamRequest(meta: DumpRequestMeta) {
+      try { writeFileSync(`${tmpDir}/downstream-request.log`, formatRequestLog(meta)); } catch {}
+    },
+    writeUpstreamRequest(meta: DumpRequestMeta) {
+      try { writeFileSync(`${tmpDir}/upstream-request.log`, formatRequestLog(meta)); } catch {}
     },
     writeUpstreamResponse(meta: DumpUpstreamResponseMeta) {
       try { writeFileSync(`${tmpDir}/upstream-response.log`, formatResponseLog(meta)); } catch {}

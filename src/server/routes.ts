@@ -78,7 +78,7 @@ function parseMessagesBody(body: unknown): { data: RequestData; error?: never } 
 }
 
 /** Build the upstream OpenAI-compatible fetch request. */
-function buildUpstreamRequest(requestData: RequestData, apiKey: string, config: ServerConfig): Request {
+function buildUpstreamRequest(requestData: RequestData, apiKey: string, config: ServerConfig): { request: Request; requestBody: string; requestHeaders: Record<string, string> } {
   let body = buildBaseRequestBody(requestData, 4096, ReasoningReplayMode.THINK_TAGS);
   const url = `${config.upstreamBaseUrl.replace(/\/+$/, "")}/chat/completions`;
   body.stream = true;
@@ -88,14 +88,19 @@ function buildUpstreamRequest(requestData: RequestData, apiKey: string, config: 
     body = deepMerge(body, extra);
   }
 
-  return new Request(url, {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${apiKey}`,
+  };
+  const requestBody = JSON.stringify(body, null, 2);
+
+  const request = new Request(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
+    headers,
     body: JSON.stringify(body),
   });
+
+  return { request, requestBody, requestHeaders: headers };
 }
 
 /** Parse an SSE line from the upstream into a JSON object. */
@@ -190,7 +195,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
 
   // Log downstream request with headers and datetime
   const requestHeaders = extractRequestHeaders(request);
-  dump.writeRequest({
+  dump.writeDownstreamRequest({
     headers: requestHeaders,
     datetime: requestDatetime,
     body: JSON.stringify(body, null, 2),
@@ -211,7 +216,14 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   // via the second argument of fetch() because Bun does not propagate
   // Request.signal through fetch(request) to the init layer.
   const abortSignal = request.signal;
-  const upstreamReq = buildUpstreamRequest(requestData, apiKey, config);
+  const { request: upstreamReq, requestBody: upstreamRequestBody, requestHeaders: upstreamReqHeaders } = buildUpstreamRequest(requestData, apiKey, config);
+
+  // Log upstream request (what the proxy sends to the upstream API)
+  dump.writeUpstreamRequest({
+    headers: upstreamReqHeaders,
+    datetime: new Date().toISOString(),
+    body: upstreamRequestBody,
+  });
   let upstreamRes: Response;
   let ttfb: number | undefined;
   try {
