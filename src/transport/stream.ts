@@ -177,7 +177,45 @@ export async function* streamOpenAIChatToAnthropicSse(
       }
 
       // Handle native tool calls
-      if (delta.tool_calls) {
+      if (delta.tool_calls?.length) {
+    // Flush any text buffered in the heuristic parser before starting tool blocks.
+    // The HeuristicToolParser buffers text looking for ● patterns, but when native
+    // tool_calls arrive, that buffered text must be emitted first so text content
+    // blocks appear before tool_use blocks in the Anthropic SSE output.
+    const heuristicFlush = heuristicParser.flush();
+    if (heuristicFlush.text) {
+      for (const event of sse.ensure_text_block()) yield event;
+      yield sse.emit_text_delta(heuristicFlush.text);
+    }
+    for (const toolUse of heuristicFlush.tools) {
+      if (serverToolsEnabled && isHeuristicServerTool(toolUse)) {
+        const toolName = mapServerToolName(toolUse.name as string);
+        const toolId = `srvtool_${randomUUID().slice(0, 12)}`;
+        const input = (toolUse.input ?? {}) as Record<string, unknown>;
+
+        yield* sse.close_content_blocks();
+        yield* sse.emit_server_tool_use(toolId, toolName, input);
+
+        if (toolName === "web_search" && enableWebSearch) {
+          const query = String(input.query ?? "");
+          if (query) {
+            const results = await executeWebSearch(query, serverToolConfig!);
+            const content = formatWebSearchResultContent(results);
+            yield* sse.emit_web_search_tool_result(toolId, content);
+          }
+        } else if (toolName === "web_fetch" && enableWebFetch) {
+          const url = String(input.url ?? "");
+          if (url) {
+            const result = await executeWebFetch(url, serverToolConfig!);
+            const content = formatWebFetchResultContent(result);
+            const status = result.status_code >= 400 ? "error" : undefined;
+            yield* sse.emit_web_fetch_tool_result(toolId, content, status);
+          }
+        }
+      } else {
+        for (const event of iterHeuristicToolUseSse(sse, toolUse)) yield event;
+      }
+    }
         for (const event of sse.close_content_blocks()) yield event;
         for (const tc of delta.tool_calls) {
           const tcInfo = {
