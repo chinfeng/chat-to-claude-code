@@ -73,6 +73,7 @@ function parseMessagesBody(body: unknown): { data: RequestData; error?: never } 
       stop_sequences: b.stop_sequences as string[] | undefined,
       tools: b.tools as Record<string, unknown>[] | undefined,
       tool_choice: b.tool_choice,
+      server_tools: b.server_tools as Record<string, unknown>[] | undefined,
     },
   };
 }
@@ -314,6 +315,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     requestData,
     inputTokens,
     config.enableThinking,
+    config.serverTools,
   );
 
   const downstreamChunks: string[] = [];

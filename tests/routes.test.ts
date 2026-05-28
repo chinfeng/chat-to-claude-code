@@ -10,6 +10,15 @@ const TEST_CONFIG: ServerConfig = {
   enableThinking: true,
   dumpDir: "",
   modelOverrides: [],
+  serverTools: {
+    webSearch: false,
+    webFetch: false,
+    webSearchApiKey: "",
+    webSearchBaseUrl: "https://api.search.brave.com",
+    webFetchAllowedDomains: [],
+    webFetchBlockedDomains: [],
+    webFetchMaxContentTokens: 5000,
+  },
 };
 
 describe("routeRequest", () => {
@@ -80,14 +89,27 @@ describe("routeRequest", () => {
       upstreamApiKey: "",
       authToken: "",
     };
-    // This will fail at fetch (no real upstream), but should not 401
     const req = new Request("http://localhost/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": "client-key" },
       body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
     });
     const res = await routeRequest(req, passthroughConfig);
-    // It might be 502 (upstream error) but NOT 401
     expect(res.status).not.toBe(401);
+  });
+
+  it("passes server_tools through in parsed request data", async () => {
+    const req = new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "hi" }],
+        server_tools: [{ type: "web_search_20250305", name: "web_search" }],
+      }),
+    });
+    // This will fail at fetch (no real upstream), but should not 400
+    const res = await routeRequest(req, TEST_CONFIG);
+    expect(res.status).not.toBe(400);
   });
 });

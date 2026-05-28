@@ -156,4 +156,101 @@ describe("SSEBuilder", () => {
     expect(event).toContain("event: error");
     expect(event).toContain("Fatal");
   });
+
+  it("emit_server_tool_use produces server_tool_use block", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const events = [...sse.emit_server_tool_use("st_001", "web_search", { query: "test" })];
+    expect(events.length).toBe(2); // block_start + block_stop
+    const startEvent = events[0];
+    expect(startEvent).toContain("event: content_block_start");
+    expect(startEvent).toContain("server_tool_use");
+    const data = JSON.parse(startEvent.split("data: ")[1]);
+    expect(data.content_block.name).toBe("web_search");
+    expect(data.content_block.id).toBe("st_001");
+    expect(data.content_block.input.query).toBe("test");
+  });
+
+  it("emit_web_search_tool_result produces web_search_tool_result block", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const content = [{ type: "web_search_result", url: "https://example.com", title: "Example" }];
+    const events = [...sse.emit_web_search_tool_result("st_001", content)];
+    expect(events.length).toBe(2);
+    const startEvent = events[0];
+    expect(startEvent).toContain("web_search_tool_result");
+    const data = JSON.parse(startEvent.split("data: ")[1]);
+    expect(data.content_block.type).toBe("web_search_tool_result");
+    expect(data.content_block.tool_use_id).toBe("st_001");
+  });
+
+  it("emit_web_search_tool_result includes error status when provided", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const content = [{ type: "web_search_result", url: "https://example.com", title: "Error" }];
+    const events = [...sse.emit_web_search_tool_result("st_001", content, "error")];
+    const startEvent = events[0];
+    const data = JSON.parse(startEvent.split("data: ")[1]);
+    expect(data.content_block.status).toBe("error");
+  });
+
+  it("emit_web_fetch_tool_result produces web_fetch_tool_result block", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const content = [{ type: "text", text: "Fetched content" }];
+    const events = [...sse.emit_web_fetch_tool_result("st_002", content)];
+    expect(events.length).toBe(2);
+    const startEvent = events[0];
+    expect(startEvent).toContain("web_fetch_tool_result");
+    const data = JSON.parse(startEvent.split("data: ")[1]);
+    expect(data.content_block.type).toBe("web_fetch_tool_result");
+    expect(data.content_block.tool_use_id).toBe("st_002");
+  });
+
+  it("emit_web_fetch_tool_result includes error status for failed fetches", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const content = [{ type: "text", text: "Domain blocked" }];
+    const events = [...sse.emit_web_fetch_tool_result("st_003", content, "error")];
+    const startEvent = events[0];
+    const data = JSON.parse(startEvent.split("data: ")[1]);
+    expect(data.content_block.status).toBe("error");
+  });
+
+  it("content_block_start formats server_tool_use correctly", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const event = sse.content_block_start(5, "server_tool_use", {
+      id: "st_100",
+      name: "web_search",
+      input: { query: "hello" },
+    });
+    const data = JSON.parse(event.split("data: ")[1]);
+    expect(data.index).toBe(5);
+    expect(data.content_block.type).toBe("server_tool_use");
+    expect(data.content_block.id).toBe("st_100");
+    expect(data.content_block.name).toBe("web_search");
+    expect(data.content_block.input.query).toBe("hello");
+  });
+
+  it("content_block_start formats web_search_tool_result correctly", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const content = [{ type: "web_search_result", url: "https://x.com" }];
+    const event = sse.content_block_start(6, "web_search_tool_result", {
+      tool_use_id: "st_200",
+      content,
+    });
+    const data = JSON.parse(event.split("data: ")[1]);
+    expect(data.content_block.type).toBe("web_search_tool_result");
+    expect(data.content_block.tool_use_id).toBe("st_200");
+    expect(data.content_block.content).toEqual(content);
+  });
+
+  it("content_block_start formats web_fetch_tool_result correctly", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const content = [{ type: "text", text: "data" }];
+    const event = sse.content_block_start(7, "web_fetch_tool_result", {
+      tool_use_id: "st_300",
+      content,
+      status: "error",
+    });
+    const data = JSON.parse(event.split("data: ")[1]);
+    expect(data.content_block.type).toBe("web_fetch_tool_result");
+    expect(data.content_block.tool_use_id).toBe("st_300");
+    expect(data.content_block.status).toBe("error");
+  });
 });

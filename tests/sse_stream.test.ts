@@ -639,7 +639,8 @@ describe("SSE stream forwarding", () => {
       const renamedDir = dirs.find((d) => d.includes("__START_"))!;
       const { readdirSync: readdir2 } = await import("node:fs");
       const files = readdir2(`${tmpDir}/${renamedDir}`);
-      expect(files).toContain("request.log");
+      expect(files).toContain("downstream-request.log");
+      expect(files).toContain("upstream-request.log");
       expect(files).toContain("upstream-response.log");
       expect(files).toContain("downstream-response.log");
     } finally {

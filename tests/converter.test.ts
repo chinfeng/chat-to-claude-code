@@ -44,7 +44,7 @@ describe("AnthropicToOpenAIConverter", () => {
       const content = result[0].content as string;
       expect(content).toContain("Let me think...");
       expect(content).toContain("Here is the answer.");
-      expect(content).toContain("<think>\n");
+      expect(content).toContain("\nLet me think...\n");
     });
 
     it("skips thinking blocks when DISABLED", () => {
@@ -143,7 +143,6 @@ describe("AnthropicToOpenAIConverter", () => {
         },
       ];
       const result = AnthropicToOpenAIConverter.convertMessages(messages);
-      // The deferred text should appear after the tool result
       const hasExplanation = result.some(
         (m) => m.role === "assistant" && typeof m.content === "string" && m.content.includes("Now I can explain."),
       );
@@ -174,14 +173,55 @@ describe("AnthropicToOpenAIConverter", () => {
       expect(() => AnthropicToOpenAIConverter.convertMessages(messages)).toThrow(OpenAIConversionError);
     });
 
-    it("throws for server_tool_use blocks", () => {
+    it("handles server_tool_use blocks by skipping them (proxy-side only)", () => {
       const messages: AnthropicMessage[] = [
         {
           role: "assistant",
-          content: [{ type: "server_tool_use", id: "st_1", name: "web_search" }],
+          content: [
+            { type: "text", text: "Let me search for that." },
+            { type: "server_tool_use", id: "st_1", name: "web_search", input: { query: "test" } },
+          ],
         },
       ];
-      expect(() => AnthropicToOpenAIConverter.convertMessages(messages)).toThrow(OpenAIConversionError);
+      const result = AnthropicToOpenAIConverter.convertMessages(messages);
+      expect(result.length).toBe(1);
+      expect(result[0].role).toBe("assistant");
+      const content = result[0].content as string;
+      expect(content).toContain("Let me search for that.");
+    });
+
+    it("converts web_search_tool_result blocks as tool results", () => {
+      const messages: AnthropicMessage[] = [
+        {
+          role: "user",
+          content: [
+            {
+              type: "web_search_tool_result",
+              tool_use_id: "st_1",
+              content: [{ type: "web_search_result", url: "https://example.com", title: "Example" }],
+            },
+          ],
+        },
+      ];
+      const result = AnthropicToOpenAIConverter.convertMessages(messages);
+      expect(result).toEqual([{ role: "tool", tool_call_id: "st_1", content: '{"type":"web_search_result","url":"https://example.com","title":"Example"}' }]);
+    });
+
+    it("converts web_fetch_tool_result blocks as tool results", () => {
+      const messages: AnthropicMessage[] = [
+        {
+          role: "user",
+          content: [
+            {
+              type: "web_fetch_tool_result",
+              tool_use_id: "st_2",
+              content: [{ type: "text", text: "Page content here" }],
+            },
+          ],
+        },
+      ];
+      const result = AnthropicToOpenAIConverter.convertMessages(messages);
+      expect(result).toEqual([{ role: "tool", tool_call_id: "st_2", content: "Page content here" }]);
     });
   });
 

@@ -113,6 +113,13 @@ describe("loadConfig", () => {
     expect(config.enableThinking).toBe(true);
     expect(config.dumpDir).toBe("");
     expect(config.modelOverrides).toEqual([]);
+    expect(config.serverTools.webSearch).toBe(false);
+    expect(config.serverTools.webFetch).toBe(false);
+    expect(config.serverTools.webSearchApiKey).toBe("");
+    expect(config.serverTools.webSearchBaseUrl).toBe("https://api.search.brave.com");
+    expect(config.serverTools.webFetchAllowedDomains).toEqual([]);
+    expect(config.serverTools.webFetchBlockedDomains).toEqual([]);
+    expect(config.serverTools.webFetchMaxContentTokens).toBe(5000);
 
     Bun.argv = origArgv;
   });
@@ -136,6 +143,32 @@ describe("loadConfig", () => {
     expect(config.port).toBe(9090);
     expect(config.enableThinking).toBe(false);
     expect(config.dumpDir).toBe("/tmp/dumps");
+
+    Bun.argv = origArgv;
+  });
+
+  it("reads server tool CLI arguments", () => {
+    const origArgv = Bun.argv;
+    Bun.argv = [
+      "bun", "run", "src/server/index.ts",
+      "--enable-web-search",
+      "--enable-web-fetch",
+      "--web-search-api-key", "BST-xxx",
+      "--web-search-base-url", "https://custom.search.api",
+      "--web-fetch-allowed-domain", "example.com",
+      "--web-fetch-allowed-domain", "docs.example.com",
+      "--web-fetch-blocked-domain", "spam.com",
+      "--web-fetch-max-content-tokens", "10000",
+    ];
+
+    const config = loadConfig();
+    expect(config.serverTools.webSearch).toBe(true);
+    expect(config.serverTools.webFetch).toBe(true);
+    expect(config.serverTools.webSearchApiKey).toBe("BST-xxx");
+    expect(config.serverTools.webSearchBaseUrl).toBe("https://custom.search.api");
+    expect(config.serverTools.webFetchAllowedDomains).toEqual(["example.com", "docs.example.com"]);
+    expect(config.serverTools.webFetchBlockedDomains).toEqual(["spam.com"]);
+    expect(config.serverTools.webFetchMaxContentTokens).toBe(10000);
 
     Bun.argv = origArgv;
   });

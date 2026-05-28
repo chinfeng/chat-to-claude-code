@@ -131,6 +131,36 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--no-enable-thinking` | — | Disable thinking conversion |
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
+| `--enable-web-search` | `false` | Enable proxy-side web search (Brave Search API) |
+| `--enable-web-fetch` | `false` | Enable proxy-side web fetch (HTTP GET with domain filtering) |
+| `--web-search-api-key` | `""` | Brave Search API key for web search |
+| `--web-search-base-url` | `https://api.search.brave.com` | Brave Search API base URL |
+| `--web-fetch-allowed-domain` | — | Allowed domain for web fetch (repeatable, e.g., `--web-fetch-allowed-domain example.com`) |
+| `--web-fetch-blocked-domain` | — | Blocked domain for web fetch (repeatable) |
+| `--web-fetch-max-content-tokens` | `5000` | Max content tokens for web fetch results |
+
+### Server Tools (Web Search & Web Fetch)
+
+This proxy can execute Anthropic-style `web_search` and `web_fetch` server tools on behalf of upstream models that don't natively support them. When a model emits a tool call matching `WebSearch` / `WebFetch` in its text output, the proxy intercepts it, executes the request, and returns the result as an Anthropic `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` content block.
+
+```bash
+# Enable both web search and web fetch
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-api-key BST-xxxx \
+  --enable-web-fetch \
+  --web-fetch-allowed-domain docs.example.com \
+  --web-fetch-allowed-domain api.example.com
+```
+
+**How it works:**
+
+1. The client sends a request with `server_tools: [{type: "web_search_20250305"}, {type: "web_fetch_20250305"}]`
+2. The proxy detects the server tool types, strips them before forwarding to the upstream
+3. If the upstream model calls `WebSearch` / `WebFetch` (as heuristic text-based tool calls), the proxy intercepts them
+4. The proxy executes the call (Brave Search API for search, direct HTTP for fetch) and emits the result back to the client as Anthropic SSE events
 
 ### Model-Specific Extra Parameters
 
@@ -165,7 +195,7 @@ When `--auth-token` is set, client requests must include a matching `x-api-key` 
 
 ### Request Dumping
 
-Enable `--dump <dir>` to log each downstream request into a sequentially numbered directory containing `request.log` and `response.log`. On completion, the directory is renamed to `{seq}-{startTime}-{endTime}` for chronological sorting. Full SSE event streams are also captured.
+Enable `--dump <dir>` to log each downstream request into a sequentially numbered directory containing `downstream-request.log`, `downstream-response.log`, `upstream-request.log`, and `upstream-response.log`. On completion, the directory is renamed to `{seq}-{startTime}-{endTime}` for chronological sorting. Full SSE event streams are also captured.
 
 ```bash
 bun run src/server/index.ts \
@@ -179,8 +209,10 @@ Example dump directory structure:
 ```
 /var/log/chat-to-claude-code/
 └── 1-2026-05-20T08-30-00-000Z-2026-05-20T08-30-05-123Z/
-    ├── request.log
-    └── response.log
+    ├── downstream-request.log
+    ├── downstream-response.log
+    ├── upstream-request.log
+    └── upstream-response.log
 ```
 
 ## Build as Single Executable
@@ -261,6 +293,7 @@ Unmatched paths return `404` with an Anthropic-format error body.
 | `delta.content` (contains thinking tag) | Parsed and dispatched as thinking / text delta |
 | `delta.content` (plain text) | `content_block_delta(text_delta)` |
 | `delta.tool_calls` | `content_block_start(tool_use)` + `content_block_delta(input_json_delta)` |
+| `delta.content` (WebSearch/WebFetch text) | `content_block_start(server_tool_use)` + `content_block_start(web_search_tool_result)` |
 | `finish_reason: "stop"` | `message_delta(stop_reason: "end_turn")` |
 | `finish_reason: "tool_calls"` | `message_delta(stop_reason: "tool_use")` |
 
@@ -347,7 +380,8 @@ src/
 ├── server/
 │   ├── config.ts          # CLI argument configuration loader
 │   ├── index.ts           # Bun.serve() entry point + CORS
-│   └── routes.ts          # HTTP route handling + auth
+│   ├── routes.ts          # HTTP route handling + auth
+│   └── server_tools.ts    # Proxy-side web_search / web_fetch execution
 ├── sse/
 │   └── builder.ts         # Anthropic SSE event builder
 ├── transport/
@@ -396,7 +430,7 @@ This project is a streamlined TypeScript/Bun port of [free-claude-code](https://
 | Admin UI | Local web configuration UI | None |
 | Request optimization | quota mock / title skip / prefix detection / filepath mock | None |
 | Discord/Telegram Bot | Full bot integration | None |
-| Web Server Tools | Proxy-side web_search / web_fetch | None |
+| Web Server Tools | Proxy-side web_search / web_fetch | Proxy-side web_search / web_fetch with Brave Search API |
 | Rate Limiting | Token bucket rate limiting | None |
 | Token counting | tiktoken (cl100k_base) | char/4 estimation |
 | Logging/tracing | loguru + structured trace | console + optional dump |

@@ -194,6 +194,18 @@ export class SSEBuilder {
       contentBlock.id = kwargs.id ?? "";
       contentBlock.name = kwargs.name ?? "";
       contentBlock.input = kwargs.input ?? {};
+    } else if (blockType === "server_tool_use") {
+      contentBlock.id = kwargs.id ?? "";
+      contentBlock.name = kwargs.name ?? "";
+      contentBlock.input = kwargs.input ?? {};
+    } else if (blockType === "web_search_tool_result") {
+      contentBlock.tool_use_id = kwargs.tool_use_id ?? "";
+      if (kwargs.content) contentBlock.content = kwargs.content;
+      if (kwargs.status === "error") contentBlock.status = "error";
+    } else if (blockType === "web_fetch_tool_result") {
+      contentBlock.tool_use_id = kwargs.tool_use_id ?? "";
+      if (kwargs.content) contentBlock.content = kwargs.content;
+      if (kwargs.status === "error") contentBlock.status = "error";
     }
     return formatSseEvent("content_block_start", {
       type: "content_block_start",
@@ -313,6 +325,51 @@ export class SSEBuilder {
     yield this.content_block_start(errorIndex, "text");
     yield this.content_block_delta(errorIndex, "text_delta", errorMessage);
     yield this.content_block_stop(errorIndex);
+  }
+
+  /** Emit a complete server_tool_use content block (non-streaming — all data at once). */
+  *emit_server_tool_use(
+    toolId: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): Generator<string> {
+    const index = this.blocks.allocateIndex();
+    yield this.content_block_start(index, "server_tool_use", {
+      id: toolId,
+      name: toolName,
+      input,
+    });
+    yield this.content_block_stop(index);
+  }
+
+  /** Emit a complete web_search_tool_result content block (non-streaming). */
+  *emit_web_search_tool_result(
+    toolUseId: string,
+    content: Record<string, unknown>[],
+    status?: string,
+  ): Generator<string> {
+    const index = this.blocks.allocateIndex();
+    yield this.content_block_start(index, "web_search_tool_result", {
+      tool_use_id: toolUseId,
+      content,
+      ...(status ? { status } : {}),
+    });
+    yield this.content_block_stop(index);
+  }
+
+  /** Emit a complete web_fetch_tool_result content block (non-streaming). */
+  *emit_web_fetch_tool_result(
+    toolUseId: string,
+    content: Record<string, unknown>[],
+    status?: string,
+  ): Generator<string> {
+    const index = this.blocks.allocateIndex();
+    yield this.content_block_start(index, "web_fetch_tool_result", {
+      tool_use_id: toolUseId,
+      content,
+      ...(status ? { status } : {}),
+    });
+    yield this.content_block_stop(index);
   }
 
   emit_top_level_error(errorMessage: string): string {

@@ -5,6 +5,15 @@ import { SSEBuilder, mapStopReason } from "../sse/builder.js";
 import { ThinkTagParser, ContentType, HeuristicToolParser } from "../parsers/index.js";
 import { buildBaseRequestBody, ReasoningReplayMode } from "../conversion/converter.js";
 import type { RequestData } from "../conversion/converter.js";
+import type { ServerToolConfig } from "../server/config.js";
+import {
+  executeWebSearch,
+  executeWebFetch,
+  formatWebSearchResultContent,
+  formatWebFetchResultContent,
+  requestHasWebSearch,
+  requestHasWebFetch,
+} from "../server/server_tools.js";
 
 /** Thrown when the upstream embeds an error object in the SSE stream (HTTP 200 with error payload). */
 export class UpstreamStreamError extends Error {
@@ -55,15 +64,32 @@ function isThinkingEnabled(request: RequestData, hint?: boolean | null): boolean
   return true;
 }
 
+/** Check if a heuristic tool call is a server tool (WebSearch/WebFetch). */
+function isHeuristicServerTool(toolUse: Record<string, unknown>): boolean {
+  const name = toolUse.name as string;
+  return name === "WebSearch" || name === "WebFetch";
+}
+
+/** Map heuristic tool name to Anthropic server tool name. */
+function mapServerToolName(name: string): "web_search" | "web_fetch" {
+  if (name === "WebSearch") return "web_search";
+  return "web_fetch";
+}
+
 export async function* streamOpenAIChatToAnthropicSse(
   upstreamStream: AsyncIterable<StreamChunk>,
   request: RequestData,
   inputTokens: number,
   thinkingEnabledHint?: boolean | null,
+  serverToolConfig?: ServerToolConfig,
 ): AsyncGenerator<string> {
   const messageId = `msg_${randomUUID()}`;
   const sse = new SSEBuilder(messageId, request.model, inputTokens);
   const thinkingEnabled = isThinkingEnabled(request, thinkingEnabledHint);
+
+  const enableWebSearch = serverToolConfig?.webSearch && requestHasWebSearch(request.server_tools);
+  const enableWebFetch = serverToolConfig?.webFetch && requestHasWebFetch(request.server_tools);
+  const serverToolsEnabled = enableWebSearch || enableWebFetch;
 
   const body = buildBaseRequestBody(request, undefined, ReasoningReplayMode.THINK_TAGS);
   const thinkParser = new ThinkTagParser();
@@ -115,7 +141,36 @@ export async function* streamOpenAIChatToAnthropicSse(
               yield sse.emit_text_delta(filteredText);
             }
             for (const toolUse of detectedTools) {
-              for (const event of iterHeuristicToolUseSse(sse, toolUse)) yield event;
+              // Check if this is a server tool call
+              if (serverToolsEnabled && isHeuristicServerTool(toolUse)) {
+                const toolName = mapServerToolName(toolUse.name as string);
+                const toolId = `srvtool_${randomUUID().slice(0, 12)}`;
+                const input = (toolUse.input ?? {}) as Record<string, unknown>;
+
+                yield* sse.close_content_blocks();
+                // Emit server_tool_use block
+                yield* sse.emit_server_tool_use(toolId, toolName, input);
+
+                // Execute and emit result
+                if (toolName === "web_search" && enableWebSearch) {
+                  const query = String(input.query ?? "");
+                  if (query) {
+                    const results = await executeWebSearch(query, serverToolConfig!);
+                    const content = formatWebSearchResultContent(results);
+                    yield* sse.emit_web_search_tool_result(toolId, content);
+                  }
+                } else if (toolName === "web_fetch" && enableWebFetch) {
+                  const url = String(input.url ?? "");
+                  if (url) {
+                    const result = await executeWebFetch(url, serverToolConfig!);
+                    const content = formatWebFetchResultContent(result);
+                    const status = result.status_code >= 400 ? "error" : undefined;
+                    yield* sse.emit_web_fetch_tool_result(toolId, content, status);
+                  }
+                }
+              } else {
+                for (const event of iterHeuristicToolUseSse(sse, toolUse)) yield event;
+              }
             }
           }
         }
@@ -161,13 +216,39 @@ export async function* streamOpenAIChatToAnthropicSse(
     }
   }
 
-    const heuristicFlush = heuristicParser.flush();
+  const heuristicFlush = heuristicParser.flush();
   if (heuristicFlush.text) {
     for (const event of sse.ensure_text_block()) yield event;
     yield sse.emit_text_delta(heuristicFlush.text);
   }
   for (const toolUse of heuristicFlush.tools) {
-    for (const event of iterHeuristicToolUseSse(sse, toolUse)) yield event;
+    if (serverToolsEnabled && isHeuristicServerTool(toolUse)) {
+      const toolName = mapServerToolName(toolUse.name as string);
+      const toolId = `srvtool_${randomUUID().slice(0, 12)}`;
+      const input = (toolUse.input ?? {}) as Record<string, unknown>;
+
+      yield* sse.close_content_blocks();
+      yield* sse.emit_server_tool_use(toolId, toolName, input);
+
+      if (toolName === "web_search" && enableWebSearch) {
+        const query = String(input.query ?? "");
+        if (query) {
+          const results = await executeWebSearch(query, serverToolConfig!);
+          const content = formatWebSearchResultContent(results);
+          yield* sse.emit_web_search_tool_result(toolId, content);
+        }
+      } else if (toolName === "web_fetch" && enableWebFetch) {
+        const url = String(input.url ?? "");
+        if (url) {
+          const result = await executeWebFetch(url, serverToolConfig!);
+          const content = formatWebFetchResultContent(result);
+          const status = result.status_code >= 400 ? "error" : undefined;
+          yield* sse.emit_web_fetch_tool_result(toolId, content, status);
+        }
+      }
+    } else {
+      for (const event of iterHeuristicToolUseSse(sse, toolUse)) yield event;
+    }
   }
 
   // Ensure at least one content block exists

@@ -121,15 +121,17 @@ function assertNoForbiddenAssistantBlock(block: ContentBlock): void {
       "Assistant image blocks are not supported for OpenAI chat conversion.",
     );
   }
-  if (
-    blockType === "server_tool_use" ||
+  // server_tool_use, web_search_tool_result, web_fetch_tool_result are handled
+  // separately by server tool injection — they are not forbidden, just skipped
+  // in normal conversion since they're proxy-side only.
+}
+
+/** Check if a block type is a tool-result-like block that should be serialized
+ *  as an OpenAI "tool" role message. */
+function isToolResultBlockType(blockType: string | null): boolean {
+  return blockType === "tool_result" ||
     blockType === "web_search_tool_result" ||
-    blockType === "web_fetch_tool_result"
-  ) {
-    throw new OpenAIConversionError(
-      `OpenAI chat conversion does not support Anthropic server tool blocks (${JSON.stringify(blockType)} in an assistant message). Use a native Anthropic transport provider.`,
-    );
-  }
+    blockType === "web_fetch_tool_result";
 }
 
 export interface AnthropicMessage {
@@ -285,7 +287,7 @@ function _convertUserMessageWithInjection(
       throw new OpenAIConversionError(
         "User message image blocks are not supported for OpenAI chat conversion.",
       );
-    } else if (blockType === "tool_result") {
+    } else if (isToolResultBlockType(blockType)) {
       flushText();
       const toolContent = getBlockAttr(block, "content", "");
       const serialized = serializeToolResultContent(toolContent);
@@ -332,7 +334,7 @@ function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[]
       throw new OpenAIConversionError(
         "User message image blocks are not supported for OpenAI chat conversion.",
       );
-    } else if (blockType === "tool_result") {
+    } else if (isToolResultBlockType(blockType)) {
       flushText();
       const toolContent = getBlockAttr(block, "content", "");
       const serialized = serializeToolResultContent(toolContent);
@@ -505,6 +507,7 @@ export interface RequestData {
   stop_sequences?: string[] | null;
   tools?: Record<string, unknown>[] | null;
   tool_choice?: unknown;
+  server_tools?: Record<string, unknown>[] | null;
 }
 
 export function buildBaseRequestBody(

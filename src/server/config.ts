@@ -5,6 +5,16 @@ export interface ModelOverride {
   extra: Record<string, unknown>;
 }
 
+export interface ServerToolConfig {
+  webSearch: boolean;
+  webFetch: boolean;
+  webSearchApiKey: string;
+  webSearchBaseUrl: string;
+  webFetchAllowedDomains: string[];
+  webFetchBlockedDomains: string[];
+  webFetchMaxContentTokens: number;
+}
+
 export interface ServerConfig {
   upstreamBaseUrl: string;
   upstreamApiKey: string;
@@ -13,23 +23,24 @@ export interface ServerConfig {
   enableThinking: boolean;
   dumpDir: string;
   modelOverrides: ModelOverride[];
+  serverTools: ServerToolConfig;
 }
 
 /** Minimal glob matching: supports `*` (any segment chars) and `?` (single char). */
 export function globMatch(pattern: string, text: string): boolean {
   const re = new RegExp(
     "^" +
-      pattern
-        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-        .replace(/\*/g, ".*")
-        .replace(/\?/g, ".") +
-      "$",
+    pattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*/g, ".*")
+      .replace(/\?/g, ".") +
+    "$",
   );
   return re.test(text);
 }
 
 /** Select model-specific extra params by matching the model name against glob patterns.
- *  First matching pattern wins; returns `{}` if nothing matches. */
+ * First matching pattern wins; returns `{}` if nothing matches. */
 export function resolveModelExtra(
   model: string,
   overrides: ModelOverride[] | undefined,
@@ -129,6 +140,16 @@ function parseArgs(): ServerConfig {
     modelOverrides.push({ pattern, extra });
   }
 
+  const serverTools: ServerToolConfig = {
+    webSearch: getBool("enable-web-search", false),
+    webFetch: getBool("enable-web-fetch", false),
+    webSearchApiKey: getArg("web-search-api-key", ""),
+    webSearchBaseUrl: getArg("web-search-base-url", "https://api.search.brave.com"),
+    webFetchAllowedDomains: getMultiArg("web-fetch-allowed-domain"),
+    webFetchBlockedDomains: getMultiArg("web-fetch-blocked-domain"),
+    webFetchMaxContentTokens: parseInt(getArg("web-fetch-max-content-tokens", "5000"), 10),
+  };
+
   return {
     upstreamBaseUrl: getArg("upstream-base-url", "https://api.openai.com/v1"),
     upstreamApiKey: getArg("upstream-api-key", ""),
@@ -137,6 +158,7 @@ function parseArgs(): ServerConfig {
     enableThinking: getBool("enable-thinking", true),
     dumpDir: getArg("dump", ""),
     modelOverrides,
+    serverTools,
   };
 }
 
