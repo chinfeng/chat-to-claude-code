@@ -42,12 +42,33 @@ export interface DumpTiming {
   totalTime: number;
 }
 
+export interface ServerToolLogEntry {
+  tool: "web_search" | "web_fetch";
+  timestamp: string;
+  /** For web_search: the query string. For web_fetch: the target URL. */
+  input: string;
+  /** Search engine used (web_search only). */
+  engine?: string;
+  /** HTTP status code from the upstream API (web_search) or target site (web_fetch). */
+  status?: number;
+  /** Number of results returned (web_search only). */
+  resultCount?: number;
+  /** Whether the call was skipped (e.g. missing API key, empty query). */
+  skipped?: boolean;
+  skipReason?: string;
+  /** Error message if the call failed. */
+  error?: string;
+  /** Duration in milliseconds. */
+  durationMs?: number;
+}
+
 export interface DumpSession {
   writeDownstreamRequest(meta: DumpRequestMeta): void;
   writeUpstreamRequest(meta: DumpRequestMeta): void;
   writeUpstreamResponse(meta: DumpUpstreamResponseMeta): void;
   writeDownstreamResponse(meta: DumpDownstreamResponseMeta): void;
   setTiming(timing: DumpTiming): void;
+  logServerTool(entry: ServerToolLogEntry): void;
   finish(): void;
 }
 
@@ -57,6 +78,7 @@ const noopSession: DumpSession = {
   writeUpstreamResponse() {},
   writeDownstreamResponse() {},
   setTiming() {},
+  logServerTool() {},
   finish() {},
 };
 
@@ -118,6 +140,26 @@ export function createDumpSession(dumpDir: string): DumpSession {
   try { mkdirSync(dumpDir, { recursive: true }); } catch {}
   try { mkdirSync(tmpDir, { recursive: true }); } catch {}
 
+  const serverToolLogs: string[] = [];
+
+  function formatServerToolEntry(entry: ServerToolLogEntry): string {
+    let out = "";
+    out += formatSection("Tool", entry.tool);
+    out += formatSection("Timestamp", entry.timestamp);
+    out += formatSection("Input", entry.input);
+    if (entry.engine) out += formatSection("Engine", entry.engine);
+    if (entry.status !== undefined) out += formatSection("Status", String(entry.status));
+    if (entry.resultCount !== undefined) out += formatSection("Result Count", String(entry.resultCount));
+    if (entry.skipped) {
+      out += formatSection("Skipped", "true");
+      if (entry.skipReason) out += formatSection("Skip Reason", entry.skipReason);
+    }
+    if (entry.error) out += formatSection("Error", entry.error);
+    if (entry.durationMs !== undefined) out += formatSection("Duration", `${entry.durationMs}ms`);
+    out += "---\n";
+    return out;
+  }
+
   return {
     writeDownstreamRequest(meta: DumpRequestMeta) {
       try { writeFileSync(`${tmpDir}/downstream-request.log`, formatRequestLog(meta)); } catch {}
@@ -134,9 +176,16 @@ export function createDumpSession(dumpDir: string): DumpSession {
     setTiming(t: DumpTiming) {
       timing = t;
     },
+    logServerTool(entry: ServerToolLogEntry) {
+      serverToolLogs.push(formatServerToolEntry(entry));
+    },
     finish() {
       if (finished) return;
       finished = true;
+      // Write server-tools.log if any entries were collected
+      if (serverToolLogs.length > 0) {
+        try { writeFileSync(`${tmpDir}/server-tools.log`, serverToolLogs.join("\n")); } catch {}
+      }
       const endTime = new Date();
       const finalName = `${id}__START_${formatTime(startTime)}__END_${formatTime(endTime)}`;
       try { renameSync(tmpDir, `${dumpDir}/${finalName}`); } catch {}

@@ -2,6 +2,9 @@
 
 import { randomUUID } from "crypto";
 import type { ServerToolConfig } from "./config.js";
+import type { ServerToolLogEntry } from "../core/dump.js";
+
+export type ServerToolLogFn = (entry: ServerToolLogEntry) => void;
 
 export interface WebSearchResult {
   url: string;
@@ -44,14 +47,23 @@ export function isServerToolUseCall(name: string): name is "web_search" | "web_f
 export async function executeWebSearch(
   query: string,
   config: ServerToolConfig,
+  onLog?: ServerToolLogFn,
 ): Promise<WebSearchResult[]> {
   const baseUrl = config.webSearchBaseUrl.replace(/\/+$/, "");
   const apiKey = config.webSearchApiKey;
+  const engine = config.webSearchEngine;
+
+  if (!query.trim()) {
+    onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine, skipped: true, skipReason: "empty query" });
+    return [];
+  }
+
+  const startMs = Date.now();
 
   try {
     let results: Array<Record<string, unknown>>;
 
-    if (config.webSearchEngine === "searxng") {
+    if (engine === "searxng") {
       // SearXNG: GET /search?q=...&format=json
       const url = `${baseUrl}/search?q=${encodeURIComponent(query)}&format=json`;
       const headers: Record<string, string> = {
@@ -60,19 +72,29 @@ export async function executeWebSearch(
       if (apiKey) {
         headers["Authorization"] = `Bearer ${apiKey}`;
       }
+      onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "searxng" });
       const res = await fetch(url, { headers });
       if (!res.ok) {
-        console.warn(`SearXNG search API returned ${res.status}: ${await res.text().catch(() => "")}`);
+        const errBody = await res.text().catch(() => "");
+        console.warn(`SearXNG search API returned ${res.status}: ${errBody}`);
+        onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "searxng", status: res.status, error: `HTTP ${res.status}: ${errBody.slice(0, 500)}`, resultCount: 0, durationMs: Date.now() - startMs });
         return [];
       }
       const data = (await res.json()) as Record<string, unknown>;
       const raw = data["results"];
-      if (!Array.isArray(raw)) return [];
+      if (!Array.isArray(raw)) {
+        onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "searxng", status: res.status, resultCount: 0, durationMs: Date.now() - startMs, error: "Response 'results' field is not an array" });
+        return [];
+      }
       results = raw;
     } else {
       // Brave Search: GET /res/v1/web/search?q=...&count=10
-      if (!apiKey) return [];
+      if (!apiKey) {
+        onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "brave", skipped: true, skipReason: "no API key configured" });
+        return [];
+      }
       const url = `${baseUrl}/res/v1/web/search?q=${encodeURIComponent(query)}&count=10`;
+      onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "brave" });
       const res = await fetch(url, {
         headers: {
           "Accept": "application/json",
@@ -81,24 +103,34 @@ export async function executeWebSearch(
         },
       });
       if (!res.ok) {
-        console.warn(`Brave search API returned ${res.status}: ${await res.text().catch(() => "")}`);
+        const errBody = await res.text().catch(() => "");
+        console.warn(`Brave search API returned ${res.status}: ${errBody}`);
+        onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "brave", status: res.status, error: `HTTP ${res.status}: ${errBody.slice(0, 500)}`, resultCount: 0, durationMs: Date.now() - startMs });
         return [];
       }
       const data = (await res.json()) as Record<string, unknown>;
       const web = data["web"] as Record<string, unknown> | undefined;
       const raw = web?.["results"];
-      if (!Array.isArray(raw)) return [];
+      if (!Array.isArray(raw)) {
+        onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "brave", status: res.status, resultCount: 0, durationMs: Date.now() - startMs, error: "Response web.results field is not an array or missing" });
+        return [];
+      }
       results = raw;
     }
 
-    return results.map((r: Record<string, unknown>) => ({
+    const mapped = results.map((r: Record<string, unknown>) => ({
       url: String(r.url ?? ""),
       title: String(r.title ?? ""),
       snippet: r.description ? String(r.description) : undefined,
       page_age: r.page_age ? String(r.page_age) : undefined,
     }));
+
+    onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine, resultCount: mapped.length, durationMs: Date.now() - startMs });
+    return mapped;
   } catch (e) {
-    console.warn(`Web search failed: ${e instanceof Error ? e.message : String(e)}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`Web search failed: ${msg}`);
+    onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine, error: msg, resultCount: 0, durationMs: Date.now() - startMs });
     return [];
   }
 }
@@ -107,16 +139,21 @@ export async function executeWebSearch(
 export async function executeWebFetch(
   url: string,
   config: ServerToolConfig,
+  onLog?: ServerToolLogFn,
 ): Promise<WebFetchResult> {
+  const startMs = Date.now();
+
   // Check domain restrictions
   const parsed = parseDomain(url);
   if (!parsed) {
+    onLog?.({ tool: "web_fetch", timestamp: new Date().toISOString(), input: url, status: 400, error: "Invalid URL", durationMs: Date.now() - startMs });
     return { content: "Invalid URL", url, status_code: 400 };
   }
 
   if (config.webFetchAllowedDomains.length) {
     const allowed = config.webFetchAllowedDomains.some((d) => domainMatches(d, parsed));
     if (!allowed) {
+      onLog?.({ tool: "web_fetch", timestamp: new Date().toISOString(), input: url, status: 403, error: `Domain ${parsed} is not in the allowed list`, skipped: true, skipReason: `domain not allowed: ${parsed}`, durationMs: Date.now() - startMs });
       return { content: `Domain ${parsed} is not in the allowed list`, url, status_code: 403 };
     }
   }
@@ -124,9 +161,12 @@ export async function executeWebFetch(
   if (config.webFetchBlockedDomains.length) {
     const blocked = config.webFetchBlockedDomains.some((d) => domainMatches(d, parsed));
     if (blocked) {
+      onLog?.({ tool: "web_fetch", timestamp: new Date().toISOString(), input: url, status: 403, error: `Domain ${parsed} is blocked`, skipped: true, skipReason: `domain blocked: ${parsed}`, durationMs: Date.now() - startMs });
       return { content: `Domain ${parsed} is blocked`, url, status_code: 403 };
     }
   }
+
+  onLog?.({ tool: "web_fetch", timestamp: new Date().toISOString(), input: url });
 
   try {
     const res = await fetch(url, {
@@ -152,6 +192,8 @@ export async function executeWebFetch(
       content = content.slice(0, maxChars) + "\n\n[Content truncated]";
     }
 
+    onLog?.({ tool: "web_fetch", timestamp: new Date().toISOString(), input: url, status: res.status, durationMs: Date.now() - startMs });
+
     return {
       content,
       url: res.url || url,
@@ -160,6 +202,7 @@ export async function executeWebFetch(
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    onLog?.({ tool: "web_fetch", timestamp: new Date().toISOString(), input: url, status: 502, error: `Fetch failed: ${msg}`, durationMs: Date.now() - startMs });
     return { content: `Fetch failed: ${msg}`, url, status_code: 502 };
   }
 }

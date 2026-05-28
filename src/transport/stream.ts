@@ -6,6 +6,7 @@ import { ThinkTagParser, ContentType, HeuristicToolParser } from "../parsers/ind
 import { buildBaseRequestBody, ReasoningReplayMode } from "../conversion/converter.js";
 import type { RequestData } from "../conversion/converter.js";
 import type { ServerToolConfig } from "../server/config.js";
+import type { DumpSession } from "../core/dump.js";
 import {
   executeWebSearch,
   executeWebFetch,
@@ -82,6 +83,7 @@ export async function* streamOpenAIChatToAnthropicSse(
   inputTokens: number,
   thinkingEnabledHint?: boolean | null,
   serverToolConfig?: ServerToolConfig,
+  dump?: DumpSession,
 ): AsyncGenerator<string> {
   const messageId = `msg_${randomUUID()}`;
   const sse = new SSEBuilder(messageId, request.model, inputTokens);
@@ -90,6 +92,8 @@ export async function* streamOpenAIChatToAnthropicSse(
   const enableWebSearch = serverToolConfig?.webSearch && requestHasWebSearch(request.server_tools);
   const enableWebFetch = serverToolConfig?.webFetch && requestHasWebFetch(request.server_tools);
   const serverToolsEnabled = enableWebSearch || enableWebFetch;
+
+  const onLog = dump?.logServerTool.bind(dump);
 
   const body = buildBaseRequestBody(request, undefined, ReasoningReplayMode.THINK_TAGS);
   const thinkParser = new ThinkTagParser();
@@ -155,14 +159,14 @@ export async function* streamOpenAIChatToAnthropicSse(
                 if (toolName === "web_search" && enableWebSearch) {
                   const query = String(input.query ?? "");
                   if (query) {
-                    const results = await executeWebSearch(query, serverToolConfig!);
+                    const results = await executeWebSearch(query, serverToolConfig!, onLog);
                     const content = formatWebSearchResultContent(results);
                     yield* sse.emit_web_search_tool_result(toolId, content);
                   }
                 } else if (toolName === "web_fetch" && enableWebFetch) {
                   const url = String(input.url ?? "");
                   if (url) {
-                    const result = await executeWebFetch(url, serverToolConfig!);
+                    const result = await executeWebFetch(url, serverToolConfig!, onLog);
                     const content = formatWebFetchResultContent(result);
                     const status = result.status_code >= 400 ? "error" : undefined;
                     yield* sse.emit_web_fetch_tool_result(toolId, content, status);
@@ -199,14 +203,14 @@ export async function* streamOpenAIChatToAnthropicSse(
         if (toolName === "web_search" && enableWebSearch) {
           const query = String(input.query ?? "");
           if (query) {
-            const results = await executeWebSearch(query, serverToolConfig!);
+            const results = await executeWebSearch(query, serverToolConfig!, onLog);
             const content = formatWebSearchResultContent(results);
             yield* sse.emit_web_search_tool_result(toolId, content);
           }
         } else if (toolName === "web_fetch" && enableWebFetch) {
           const url = String(input.url ?? "");
           if (url) {
-            const result = await executeWebFetch(url, serverToolConfig!);
+            const result = await executeWebFetch(url, serverToolConfig!, onLog);
             const content = formatWebFetchResultContent(result);
             const status = result.status_code >= 400 ? "error" : undefined;
             yield* sse.emit_web_fetch_tool_result(toolId, content, status);
@@ -271,14 +275,14 @@ export async function* streamOpenAIChatToAnthropicSse(
       if (toolName === "web_search" && enableWebSearch) {
         const query = String(input.query ?? "");
         if (query) {
-          const results = await executeWebSearch(query, serverToolConfig!);
+          const results = await executeWebSearch(query, serverToolConfig!, onLog);
           const content = formatWebSearchResultContent(results);
           yield* sse.emit_web_search_tool_result(toolId, content);
         }
       } else if (toolName === "web_fetch" && enableWebFetch) {
         const url = String(input.url ?? "");
         if (url) {
-          const result = await executeWebFetch(url, serverToolConfig!);
+          const result = await executeWebFetch(url, serverToolConfig!, onLog);
           const content = formatWebFetchResultContent(result);
           const status = result.status_code >= 400 ? "error" : undefined;
           yield* sse.emit_web_fetch_tool_result(toolId, content, status);

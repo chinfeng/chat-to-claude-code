@@ -316,6 +316,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     inputTokens,
     config.enableThinking,
     config.serverTools,
+    dump,
   );
 
   const downstreamChunks: string[] = [];
