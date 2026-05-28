@@ -49,8 +49,16 @@ export interface ServerToolLogEntry {
   input: string;
   /** Search engine used (web_search only). */
   engine?: string;
+  /** The full URL sent in the HTTP request. */
+  requestUrl?: string;
+  /** Headers sent with the HTTP request. */
+  requestHeaders?: Record<string, string>;
   /** HTTP status code from the upstream API (web_search) or target site (web_fetch). */
   status?: number;
+  /** Headers received in the HTTP response. */
+  responseHeaders?: Record<string, string>;
+  /** Body received in the HTTP response (truncated if too long). */
+  responseBody?: string;
   /** Number of results returned (web_search only). */
   resultCount?: number;
   /** Whether the call was skipped (e.g. missing API key, empty query). */
@@ -148,7 +156,15 @@ export function createDumpSession(dumpDir: string): DumpSession {
     out += formatSection("Timestamp", entry.timestamp);
     out += formatSection("Input", entry.input);
     if (entry.engine) out += formatSection("Engine", entry.engine);
+    if (entry.requestUrl) out += formatSection("Request URL", entry.requestUrl);
+    if (entry.requestHeaders && Object.keys(entry.requestHeaders).length > 0) {
+      out += formatSection("Request Headers", formatHeaders(entry.requestHeaders));
+    }
     if (entry.status !== undefined) out += formatSection("Status", String(entry.status));
+    if (entry.responseHeaders && Object.keys(entry.responseHeaders).length > 0) {
+      out += formatSection("Response Headers", formatHeaders(entry.responseHeaders));
+    }
+    if (entry.responseBody) out += formatSection("Response Body", entry.responseBody);
     if (entry.resultCount !== undefined) out += formatSection("Result Count", String(entry.resultCount));
     if (entry.skipped) {
       out += formatSection("Skipped", "true");
