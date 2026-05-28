@@ -126,6 +126,14 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--no-enable-thinking` | — | 禁用 thinking 转换 |
 | `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
+| `--enable-web-search` | `false` | 启用代理端 Web 搜索 |
+| `--web-search-engine` | `brave` | 搜索引擎类型：`brave`（Brave Search API）或 `searxng`（SearXNG） |
+| `--enable-web-fetch` | `false` | 启用代理端 Web 抓取（HTTP GET + 域名过滤） |
+| `--web-search-api-key` | `""` | 搜索 API Key（Brave 必填，SearXNG 可选） |
+| `--web-search-base-url` | `https://api.search.brave.com` | 搜索 API 基础 URL |
+| `--web-fetch-allowed-domain` | — | Web 抓取允许的域名（可重复指定，如 `--web-fetch-allowed-domain example.com`） |
+| `--web-fetch-blocked-domain` | — | Web 抓取屏蔽的域名（可重复指定） |
+| `--web-fetch-max-content-tokens` | `5000` | Web 抓取结果的最大内容 token 数 |
 
 ### 按模型注入额外参数
 
@@ -149,6 +157,54 @@ bun run src/server/index.ts \
 ```
 
 当请求携带 `model: "claude-sonnet-4-20250514"` 到达时，匹配到 `claude-sonnet-*` 模式，其 JSON 会被合并到上游请求体中。`*` 通配符可作为所有未匹配模型的默认规则。
+
+### Server Tools（Web 搜索 & Web 抓取）
+
+本代理可代替不支持原生 server tools 的上游模型执行 Anthropic 风格的 `web_search` 和 `web_fetch`。当模型在文本输出中发出匹配 `WebSearch` / `WebFetch` 的工具调用时，代理会拦截、执行，并将结果以 Anthropic `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` 内容块返回。
+
+#### Brave Search（默认）
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-api-key BST-xxxx
+```
+
+#### SearXNG（自建实例）
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-engine searxng \
+  --web-search-base-url https://sea.mayeve.cn
+```
+
+SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
+
+#### 同时启用搜索和抓取
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-engine searxng \
+  --web-search-base-url https://sea.mayeve.cn \
+  --enable-web-fetch \
+  --web-fetch-allowed-domain docs.example.com \
+  --web-fetch-allowed-domain api.example.com
+```
+
+**工作流程：**
+
+1. 客户端发送带有 `server_tools: [{type: "web_search_20250305"}, {type: "web_fetch_20250305"}]` 的请求
+2. 代理检测到 server tools 类型，转发到上游前将其移除
+3. 如果上游模型以启发式文本工具调用的形式调用 `WebSearch` / `WebFetch`，代理会拦截
+4. 代理执行调用（Brave Search API 或 SearXNG 执行搜索，直接 HTTP 执行抓取），并将结果以 Anthropic SSE 事件返回给客户端
 
 ### 透传模式
 
@@ -391,7 +447,7 @@ bun run build
 | Admin UI | 本地 Web 配置界面 | 无 |
 | 请求优化 | quota mock / title skip / prefix detection / filepath mock | 无 |
 | Discord/Telegram Bot | 完整 bot 集成 | 无 |
-| Web Server Tools | 代理端 web_search / web_fetch | 无 |
+| Web Server Tools | 代理端 web_search / web_fetch | 代理端 web_search（Brave / SearXNG）/ web_fetch |
 | Rate Limiting | 令牌桶限速 | 无 |
 | Token 计数 | tiktoken (cl100k_base) | char/4 估算 |
 | 日志/追踪 | loguru + 结构化 trace | console + 可选 dump |

@@ -40,36 +40,56 @@ export function isServerToolUseCall(name: string): name is "web_search" | "web_f
   return name === "web_search" || name === "web_fetch";
 }
 
-/** Execute a web search using Brave Search API. */
+/** Execute a web search using Brave Search API or SearXNG. */
 export async function executeWebSearch(
   query: string,
   config: ServerToolConfig,
 ): Promise<WebSearchResult[]> {
-  const apiKey = config.webSearchApiKey;
-  if (!apiKey) {
-    return [];
-  }
-
   const baseUrl = config.webSearchBaseUrl.replace(/\/+$/, "");
-  const url = `${baseUrl}/res/v1/web/search?q=${encodeURIComponent(query)}&count=10`;
+  const apiKey = config.webSearchApiKey;
 
   try {
-    const res = await fetch(url, {
-      headers: {
+    let results: Array<Record<string, unknown>>;
+
+    if (config.webSearchEngine === "searxng") {
+      // SearXNG: GET /search?q=...&format=json
+      const url = `${baseUrl}/search?q=${encodeURIComponent(query)}&format=json`;
+      const headers: Record<string, string> = {
         "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": apiKey,
-      },
-    });
-
-    if (!res.ok) {
-      console.warn(`Web search API returned ${res.status}: ${await res.text().catch(() => "")}`);
-      return [];
+      };
+      if (apiKey) {
+        headers["Authorization"] = `Bearer ${apiKey}`;
+      }
+      const res = await fetch(url, { headers });
+      if (!res.ok) {
+        console.warn(`SearXNG search API returned ${res.status}: ${await res.text().catch(() => "")}`);
+        return [];
+      }
+      const data = (await res.json()) as Record<string, unknown>;
+      const raw = data["results"];
+      if (!Array.isArray(raw)) return [];
+      results = raw;
+    } else {
+      // Brave Search: GET /res/v1/web/search?q=...&count=10
+      if (!apiKey) return [];
+      const url = `${baseUrl}/res/v1/web/search?q=${encodeURIComponent(query)}&count=10`;
+      const res = await fetch(url, {
+        headers: {
+          "Accept": "application/json",
+          "Accept-Encoding": "gzip",
+          "X-Subscription-Token": apiKey,
+        },
+      });
+      if (!res.ok) {
+        console.warn(`Brave search API returned ${res.status}: ${await res.text().catch(() => "")}`);
+        return [];
+      }
+      const data = (await res.json()) as Record<string, unknown>;
+      const web = data["web"] as Record<string, unknown> | undefined;
+      const raw = web?.["results"];
+      if (!Array.isArray(raw)) return [];
+      results = raw;
     }
-
-    const data = await res.json() as Record<string, unknown>;
-    const results = data.web?.results;
-    if (!Array.isArray(results)) return [];
 
     return results.map((r: Record<string, unknown>) => ({
       url: String(r.url ?? ""),

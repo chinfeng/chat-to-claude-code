@@ -131,10 +131,11 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--no-enable-thinking` | — | Disable thinking conversion |
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
-| `--enable-web-search` | `false` | Enable proxy-side web search (Brave Search API) |
+| `--enable-web-search` | `false` | Enable proxy-side web search |
+| `--web-search-engine` | `brave` | Search engine type: `brave` (Brave Search API) or `searxng` (SearXNG) |
 | `--enable-web-fetch` | `false` | Enable proxy-side web fetch (HTTP GET with domain filtering) |
-| `--web-search-api-key` | `""` | Brave Search API key for web search |
-| `--web-search-base-url` | `https://api.search.brave.com` | Brave Search API base URL |
+| `--web-search-api-key` | `""` | Search API key (required for Brave, optional for SearXNG) |
+| `--web-search-base-url` | `https://api.search.brave.com` | Search API base URL |
 | `--web-fetch-allowed-domain` | — | Allowed domain for web fetch (repeatable, e.g., `--web-fetch-allowed-domain example.com`) |
 | `--web-fetch-blocked-domain` | — | Blocked domain for web fetch (repeatable) |
 | `--web-fetch-max-content-tokens` | `5000` | Max content tokens for web fetch results |
@@ -143,13 +144,38 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 
 This proxy can execute Anthropic-style `web_search` and `web_fetch` server tools on behalf of upstream models that don't natively support them. When a model emits a tool call matching `WebSearch` / `WebFetch` in its text output, the proxy intercepts it, executes the request, and returns the result as an Anthropic `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` content block.
 
+#### Brave Search (default)
+
 ```bash
-# Enable both web search and web fetch
 bun run src/server/index.ts \
   --upstream-base-url https://api.openai.com/v1 \
   --upstream-api-key sk-xxx \
   --enable-web-search \
-  --web-search-api-key BST-xxxx \
+  --web-search-api-key BST-xxxx
+```
+
+#### SearXNG (self-hosted)
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-engine searxng \
+  --web-search-base-url https://sea.mayeve.cn
+```
+
+No `--web-search-api-key` is required for SearXNG unless your instance requires authentication.
+
+#### Both web search and web fetch
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-engine searxng \
+  --web-search-base-url https://sea.mayeve.cn \
   --enable-web-fetch \
   --web-fetch-allowed-domain docs.example.com \
   --web-fetch-allowed-domain api.example.com
@@ -160,7 +186,7 @@ bun run src/server/index.ts \
 1. The client sends a request with `server_tools: [{type: "web_search_20250305"}, {type: "web_fetch_20250305"}]`
 2. The proxy detects the server tool types, strips them before forwarding to the upstream
 3. If the upstream model calls `WebSearch` / `WebFetch` (as heuristic text-based tool calls), the proxy intercepts them
-4. The proxy executes the call (Brave Search API for search, direct HTTP for fetch) and emits the result back to the client as Anthropic SSE events
+4. The proxy executes the call (Brave Search API or SearXNG for search, direct HTTP for fetch) and emits the result back to the client as Anthropic SSE events
 
 ### Model-Specific Extra Parameters
 
@@ -430,7 +456,7 @@ This project is a streamlined TypeScript/Bun port of [free-claude-code](https://
 | Admin UI | Local web configuration UI | None |
 | Request optimization | quota mock / title skip / prefix detection / filepath mock | None |
 | Discord/Telegram Bot | Full bot integration | None |
-| Web Server Tools | Proxy-side web_search / web_fetch | Proxy-side web_search / web_fetch with Brave Search API |
+| Web Server Tools | Proxy-side web_search / web_fetch | Proxy-side web_search (Brave / SearXNG) / web_fetch |
 | Rate Limiting | Token bucket rate limiting | None |
 | Token counting | tiktoken (cl100k_base) | char/4 estimation |
 | Logging/tracing | loguru + structured trace | console + optional dump |

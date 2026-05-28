@@ -5,9 +5,12 @@ export interface ModelOverride {
   extra: Record<string, unknown>;
 }
 
+export type WebSearchEngine = "brave" | "searxng";
+
 export interface ServerToolConfig {
   webSearch: boolean;
   webFetch: boolean;
+  webSearchEngine: WebSearchEngine;
   webSearchApiKey: string;
   webSearchBaseUrl: string;
   webFetchAllowedDomains: string[];
@@ -143,6 +146,7 @@ function parseArgs(): ServerConfig {
   const serverTools: ServerToolConfig = {
     webSearch: getBool("enable-web-search", false),
     webFetch: getBool("enable-web-fetch", false),
+    webSearchEngine: (getArg("web-search-engine", "brave") as WebSearchEngine),
     webSearchApiKey: getArg("web-search-api-key", ""),
     webSearchBaseUrl: getArg("web-search-base-url", "https://api.search.brave.com"),
     webFetchAllowedDomains: getMultiArg("web-fetch-allowed-domain"),

@@ -45,10 +45,11 @@ if (config.modelOverrides.length) {
   }
 }
 console.log(`  Web Search: ${config.serverTools.webSearch}`);
-console.log(`  Web Fetch:  ${config.serverTools.webFetch}`);
+console.log(`  Web Fetch: ${config.serverTools.webFetch}`);
 if (config.serverTools.webSearch) {
+  console.log(`    Search engine: ${config.serverTools.webSearchEngine}`);
   console.log(`    Search base URL: ${config.serverTools.webSearchBaseUrl}`);
-  console.log(`    Search API key:  ${config.serverTools.webSearchApiKey ? "configured" : "not set"}`);
+  console.log(`    Search API key: ${config.serverTools.webSearchApiKey ? "configured" : "not set"}`);
 }
 if (config.serverTools.webFetch) {
   if (config.serverTools.webFetchAllowedDomains.length) {
