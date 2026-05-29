@@ -3,7 +3,6 @@
 import { randomUUID } from "crypto";
 import { SSEBuilder, mapStopReason } from "../sse/builder.js";
 import { ThinkTagParser, ContentType, HeuristicToolParser } from "../parsers/index.js";
-import { buildBaseRequestBody, ReasoningReplayMode } from "../conversion/converter.js";
 import type { RequestData } from "../conversion/converter.js";
 import type { ServerToolConfig } from "../server/config.js";
 import type { DumpSession } from "../core/dump.js";
@@ -12,8 +11,6 @@ import {
   executeWebFetch,
   formatWebSearchResultContent,
   formatWebFetchResultContent,
-  requestHasWebSearch,
-  requestHasWebFetch,
 } from "../server/server_tools.js";
 
 /** Thrown when the upstream embeds an error object in the SSE stream (HTTP 200 with error payload). */
@@ -89,13 +86,12 @@ export async function* streamOpenAIChatToAnthropicSse(
   const sse = new SSEBuilder(messageId, request.model, inputTokens);
   const thinkingEnabled = isThinkingEnabled(request, thinkingEnabledHint);
 
-  const enableWebSearch = serverToolConfig?.webSearch && requestHasWebSearch(request.server_tools);
-  const enableWebFetch = serverToolConfig?.webFetch && requestHasWebFetch(request.server_tools);
+  const enableWebSearch = !!serverToolConfig?.webSearch;
+  const enableWebFetch = !!serverToolConfig?.webFetch;
   const serverToolsEnabled = enableWebSearch || enableWebFetch;
 
   const onLog = dump?.logServerTool.bind(dump);
 
-  const body = buildBaseRequestBody(request, undefined, ReasoningReplayMode.THINK_TAGS);
   const thinkParser = new ThinkTagParser();
   const heuristicParser = new HeuristicToolParser();
   let finishReason: string | null = null;
@@ -222,6 +218,31 @@ export async function* streamOpenAIChatToAnthropicSse(
     }
         for (const event of sse.close_content_blocks()) yield event;
         for (const tc of delta.tool_calls) {
+        const tcName = tc.function.name;
+        // Intercept native WebSearch/WebFetch tool calls as server tools
+        if (serverToolsEnabled && (tcName === "WebSearch" || tcName === "WebFetch")) {
+          const toolName = mapServerToolName(tcName);
+          const toolId = `srvtool_${randomUUID().slice(0, 12)}`;
+          let input: Record<string, unknown> = {};
+          try { input = JSON.parse(tc.function.arguments || "{}"); } catch {}
+          yield* sse.emit_server_tool_use(toolId, toolName, input);
+          if (toolName === "web_search" && enableWebSearch) {
+            const query = String(input.query ?? "");
+            if (query) {
+              const results = await executeWebSearch(query, serverToolConfig!, onLog);
+              const content = formatWebSearchResultContent(results);
+              yield* sse.emit_web_search_tool_result(toolId, content);
+            }
+          } else if (toolName === "web_fetch" && enableWebFetch) {
+            const url = String(input.url ?? "");
+            if (url) {
+              const result = await executeWebFetch(url, serverToolConfig!, onLog);
+              const content = formatWebFetchResultContent(result);
+              const status = result.status_code >= 400 ? "error" : undefined;
+              yield* sse.emit_web_fetch_tool_result(toolId, content, status);
+            }
+          }
+        } else {
           const tcInfo = {
             index: tc.index,
             id: tc.id,
@@ -229,6 +250,7 @@ export async function* streamOpenAIChatToAnthropicSse(
           };
           for (const event of processToolCall(tcInfo, sse)) yield event;
         }
+      }
       }
     }
   } catch (e) {
