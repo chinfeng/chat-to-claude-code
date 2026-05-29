@@ -248,4 +248,109 @@ describe("streamOpenAIChatToAnthropicSse", () => {
     expect(output).toContain("Just text");
     expect(output).not.toContain("tool_use");
   });
+
+  it("emits WebSearch tool calls as standard tool_use blocks (not server_tool_use)", async () => {
+    // When Claude Code sends WebSearch as a regular tool, the proxy must
+    // pass it through as a standard tool_use block — not intercept it as
+    // a server_tool_use block with empty input.
+    const chunks: StreamChunk[] = [
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_ws_001",
+              function: { name: "WebSearch", arguments: "" },
+            }],
+          },
+          finish_reason: null,
+        }],
+      },
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: null,
+              function: { name: null, arguments: '{"query":"test search"}' },
+            }],
+          },
+          finish_reason: null,
+        }],
+      },
+      { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+    ];
+
+    const serverToolConfig = { webSearch: true, webFetch: false, webSearchEngine: "brave" as const, webSearchApiKey: "test", webSearchBaseUrl: "https://api.search.brave.com", webFetchAllowedDomains: [], webFetchBlockedDomains: [], webFetchMaxContentTokens: 5000 };
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      chunksToStream(chunks),
+      TEST_REQUEST,
+      10,
+      true,
+      undefined,
+      serverToolConfig,
+    );
+
+    const output = await collectStream(stream);
+
+    // Must be tool_use, NOT server_tool_use
+    expect(output).toContain('"type":"tool_use"');
+    expect(output).not.toContain("server_tool_use");
+
+    // Name must be WebSearch (original), not web_search
+    expect(output).toContain("WebSearch");
+
+    // Input must contain the query (streamed via input_json_delta)
+    expect(output).toContain("test search");
+  });
+
+  it("emits WebFetch tool calls as standard tool_use blocks (not server_tool_use)", async () => {
+    // Same as above but for WebFetch
+    const chunks: StreamChunk[] = [
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_wf_001",
+              function: { name: "WebFetch", arguments: "" },
+            }],
+          },
+          finish_reason: null,
+        }],
+      },
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: null,
+              function: { name: null, arguments: '{"url":"https://example.com","prompt":"summarize"}' },
+            }],
+          },
+          finish_reason: null,
+        }],
+      },
+      { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+    ];
+
+    const serverToolConfig = { webSearch: false, webFetch: true, webSearchEngine: "brave" as const, webSearchApiKey: "", webSearchBaseUrl: "https://api.search.brave.com", webFetchAllowedDomains: [], webFetchBlockedDomains: [], webFetchMaxContentTokens: 5000 };
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      chunksToStream(chunks),
+      TEST_REQUEST,
+      10,
+      true,
+      undefined,
+      serverToolConfig,
+    );
+
+    const output = await collectStream(stream);
+
+    expect(output).toContain('"type":"tool_use"');
+    expect(output).not.toContain("server_tool_use");
+    expect(output).toContain("WebFetch");
+    expect(output).toContain("example.com");
+  });
 });
