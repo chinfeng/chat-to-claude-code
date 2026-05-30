@@ -6,6 +6,9 @@ import {
   formatWebSearchResultContent,
   formatWebFetchResultContent,
   detectServerToolInText,
+  buildServerToolFunctionSchema,
+  buildServerToolSystemPromptSuffix,
+  isServerToolType,
 } from "../src/server/server_tools.js";
 
 describe("requestHasWebSearch", () => {
@@ -177,5 +180,107 @@ describe("detectServerToolInText", () => {
 
   it("returns null for WebFetch without url", () => {
     expect(detectServerToolInText('WebFetch {"other": "value"}')).toBeNull();
+  });
+});
+
+describe("isServerToolType", () => {
+  it("detects web_search types", () => {
+    expect(isServerToolType("web_search_20250305")).toBe(true);
+    expect(isServerToolType("web_search")).toBe(true);
+  });
+
+  it("detects web_fetch types", () => {
+    expect(isServerToolType("web_fetch_20250305")).toBe(true);
+    expect(isServerToolType("web_fetch")).toBe(true);
+  });
+
+  it("returns false for non-server-tool types", () => {
+    expect(isServerToolType("function")).toBe(false);
+    expect(isServerToolType("text")).toBe(false);
+    expect(isServerToolType("")).toBe(false);
+  });
+});
+
+describe("buildServerToolFunctionSchema", () => {
+  it("returns web_search function schema with query parameter", () => {
+    const schema = buildServerToolFunctionSchema("web_search_20250305", "web_search");
+    expect(schema).toEqual({
+      type: "function",
+      function: {
+        name: "web_search",
+        description: "Search the web for information. Use this tool when you need to find current information, look up facts, or research topics on the internet.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query string",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    });
+  });
+
+  it("returns web_fetch function schema with url and prompt parameters", () => {
+    const schema = buildServerToolFunctionSchema("web_fetch_20250305", "web_fetch");
+    expect(schema).toEqual({
+      type: "function",
+      function: {
+        name: "web_fetch",
+        description: "Fetch the content of a web page. Use this tool when you need to read the content of a specific URL.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: {
+              type: "string",
+              description: "The URL to fetch",
+            },
+            prompt: {
+              type: "string",
+              description: "What to look for or summarize from the page",
+            },
+          },
+          required: ["url"],
+        },
+      },
+    });
+  });
+
+  it("returns null for non-server-tool type", () => {
+    expect(buildServerToolFunctionSchema("function", "read_file")).toBeNull();
+    expect(buildServerToolFunctionSchema("text", "something")).toBeNull();
+  });
+});
+
+describe("buildServerToolSystemPromptSuffix", () => {
+  it("returns prompt for web_search", () => {
+    const result = buildServerToolSystemPromptSuffix([{ type: "web_search_20250305", name: "web_search" }]);
+    expect(result).toContain("web_search");
+    expect(result).toContain("query");
+  });
+
+  it("returns prompt for web_fetch", () => {
+    const result = buildServerToolSystemPromptSuffix([{ type: "web_fetch_20250305", name: "web_fetch" }]);
+    expect(result).toContain("web_fetch");
+    expect(result).toContain("url");
+  });
+
+  it("returns combined prompt for both", () => {
+    const result = buildServerToolSystemPromptSuffix([
+      { type: "web_search_20250305", name: "web_search" },
+      { type: "web_fetch_20250305", name: "web_fetch" },
+    ]);
+    expect(result).toContain("web_search");
+    expect(result).toContain("web_fetch");
+  });
+
+  it("returns empty string for empty array", () => {
+    expect(buildServerToolSystemPromptSuffix([])).toBe("");
+  });
+
+  it("returns empty string for non-server-tools", () => {
+    expect(buildServerToolSystemPromptSuffix([{ type: "function", name: "read_file" }])).toBe("");
   });
 });

@@ -333,3 +333,82 @@ export function detectServerToolInText(
 
   return null;
 }
+
+/** Check if a tool type string is an Anthropic server tool type. */
+export function isServerToolType(type: string): boolean {
+  return type === "web_search" || type.startsWith("web_search_") ||
+         type === "web_fetch" || type.startsWith("web_fetch_");
+}
+
+/** Build an OpenAI-compatible function schema for a server tool.
+ *  Returns null if the type is not a recognized server tool. */
+export function buildServerToolFunctionSchema(
+  toolType: string,
+  toolName: string,
+): Record<string, unknown> | null {
+  if (toolType === "web_search" || toolType.startsWith("web_search_")) {
+    return {
+      type: "function",
+      function: {
+        name: toolName,
+        description: "Search the web for information. Use this tool when you need to find current information, look up facts, or research topics on the internet.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query string",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    };
+  }
+  if (toolType === "web_fetch" || toolType.startsWith("web_fetch_")) {
+    return {
+      type: "function",
+      function: {
+        name: toolName,
+        description: "Fetch the content of a web page. Use this tool when you need to read the content of a specific URL.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: {
+              type: "string",
+              description: "The URL to fetch",
+            },
+            prompt: {
+              type: "string",
+              description: "What to look for or summarize from the page",
+            },
+          },
+          required: ["url"],
+        },
+      },
+    };
+  }
+  return null;
+}
+
+/** Build a system prompt suffix that instructs the upstream model how to use server tools.
+ *  This is injected into the system prompt when server tools are present. */
+export function buildServerToolSystemPromptSuffix(
+  serverTools: Record<string, unknown>[],
+): string {
+  const parts: string[] = [];
+  for (const tool of serverTools) {
+    const type = tool.type as string;
+    if (type === "web_search" || type?.startsWith("web_search_")) {
+      parts.push(
+        "You have access to a web_search tool. When you need to search the web, call the web_search function with a JSON object containing a \"query\" field. Example: {\"query\": \"your search query\"}",
+      );
+    }
+    if (type === "web_fetch" || type?.startsWith("web_fetch_")) {
+      parts.push(
+        "You have access to a web_fetch tool. When you need to fetch a web page, call the web_fetch function with a JSON object containing a \"url\" field and optionally a \"prompt\" field. Example: {\"url\": \"https://example.com\", \"prompt\": \"summarize the page\"}",
+      );
+    }
+  }
+  return parts.join("\n\n");
+}

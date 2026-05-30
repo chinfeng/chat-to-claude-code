@@ -152,6 +152,15 @@ const TEST_CONFIG: ServerConfig = {
   enableThinking: true,
   dumpDir: "",
   modelOverrides: [],
+  serverTools: {
+    webSearch: false,
+    webFetch: false,
+    webSearchApiKey: "",
+    webSearchBaseUrl: "https://api.search.brave.com",
+    webFetchAllowedDomains: [],
+    webFetchBlockedDomains: [],
+    webFetchMaxContentTokens: 5000,
+  },
 };
 
 function makeMessagesRequest(body?: Partial<Record<string, unknown>>): Request {

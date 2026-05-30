@@ -253,4 +253,69 @@ describe("SSEBuilder", () => {
     expect(data.content_block.tool_use_id).toBe("st_300");
     expect(data.content_block.status).toBe("error");
   });
+
+  it("emit_server_tool_use produces correct server_tool_use content block", () => {
+    const sse = new SSEBuilder("msg_test", "test-model", 10);
+    const events = [...sse.emit_server_tool_use("stu_001", "web_search", { query: "test query" })];
+    expect(events.length).toBe(2); // content_block_start + content_block_stop
+
+    const startEvent = events[0];
+    expect(startEvent).toContain("event: content_block_start");
+    expect(startEvent).toContain('"type":"server_tool_use"');
+    expect(startEvent).toContain('"name":"web_search"');
+    expect(startEvent).toContain('"id":"stu_001"');
+    expect(startEvent).toContain('"query":"test query"');
+  });
+
+  it("emit_web_search_tool_result produces correct web_search_tool_result block", () => {
+    const sse = new SSEBuilder("msg_test", "test-model", 10);
+    // First emit a server_tool_use so the block index advances
+    [...sse.emit_server_tool_use("stu_001", "web_search", { query: "test" })];
+    const events = [...sse.emit_web_search_tool_result("stu_001", [
+      { type: "web_search_result", url: "https://example.com", title: "Example" },
+    ])];
+    expect(events.length).toBe(2);
+    const startEvent = events[0];
+    expect(startEvent).toContain("event: content_block_start");
+    expect(startEvent).toContain('"type":"web_search_tool_result"');
+    expect(startEvent).toContain('"tool_use_id":"stu_001"');
+    expect(startEvent).toContain('"web_search_result"');
+  });
+
+  it("emit_web_fetch_tool_result produces correct web_fetch_tool_result block", () => {
+    const sse = new SSEBuilder("msg_test", "test-model", 10);
+    [...sse.emit_server_tool_use("stu_002", "web_fetch", { url: "https://example.com" })];
+    const events = [...sse.emit_web_fetch_tool_result("stu_002", [
+      { type: "text", text: "Page content here" },
+    ])];
+    expect(events.length).toBe(2);
+    const startEvent = events[0];
+    expect(startEvent).toContain("event: content_block_start");
+    expect(startEvent).toContain('"type":"web_fetch_tool_result"');
+    expect(startEvent).toContain('"tool_use_id":"stu_002"');
+  });
+
+  it("server_tool_use and tool_result events produce correct sequential block indices", () => {
+    const sse = new SSEBuilder("msg_test", "test-model", 10);
+    // message_start (index not assigned yet)
+    const msgStart = sse.message_start();
+    expect(msgStart).toContain("event: message_start");
+
+    // server_tool_use should get index 0
+    const stuEvents = [...sse.emit_server_tool_use("stu_001", "web_search", { query: "test" })];
+    expect(stuEvents[0]).toContain('"index":0');
+
+    // web_search_tool_result should get index 1
+    const resultEvents = [...sse.emit_web_search_tool_result("stu_001", [
+      { type: "web_search_result", url: "https://example.com", title: "Example" },
+    ])];
+    expect(resultEvents[0]).toContain('"index":1');
+
+    // Text content should start at index 2
+    // (After start_text_block allocates it, nextIndex becomes 3)
+    sse.start_text_block();
+    // textIndex should be 2 (allocated after server_tool_use:0 and tool_result:1)
+    expect(sse.blocks.textIndex).toBe(2);
+    expect(sse.blocks.nextIndex).toBe(3);
+  });
 });

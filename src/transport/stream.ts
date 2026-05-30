@@ -56,6 +56,16 @@ function isThinkingEnabled(request: RequestData, hint?: boolean | null): boolean
   return true;
 }
 
+export interface StreamOptions {
+  /** Skip emitting message_start/message_delta/message_stop events.
+   *  Used when the agentic loop already emitted message_start and will
+   *  handle the message lifecycle events. */
+  skipMessageLifecycle?: boolean;
+  /** Starting block index for content blocks. Used when server_tool_use
+   *  blocks have already been emitted before this stream starts. */
+  startingBlockIndex?: number;
+}
+
 export async function* streamOpenAIChatToAnthropicSse(
   upstreamStream: AsyncIterable<StreamChunk>,
   request: RequestData,
@@ -63,17 +73,26 @@ export async function* streamOpenAIChatToAnthropicSse(
   thinkingEnabledHint?: boolean | null,
   _serverToolConfig?: ServerToolConfig,
   dump?: DumpSession,
+  options?: StreamOptions,
 ): AsyncGenerator<string> {
   const messageId = `msg_${randomUUID()}`;
   const sse = new SSEBuilder(messageId, request.model, inputTokens);
   const thinkingEnabled = isThinkingEnabled(request, thinkingEnabledHint);
+
+  // If startingBlockIndex is provided, advance the block counter
+  // so that content_block indices continue after pre-emitted blocks
+  if (options?.startingBlockIndex) {
+    sse.blocks.nextIndex = options.startingBlockIndex;
+  }
 
   const thinkParser = new ThinkTagParser();
   const heuristicParser = new HeuristicToolParser();
   let finishReason: string | null = null;
   let usageInfo: { prompt_tokens?: number; completion_tokens?: number } | null = null;
 
-  yield sse.message_start();
+  if (!options?.skipMessageLifecycle) {
+    yield sse.message_start();
+  }
 
   try {
     for await (const chunk of upstreamStream) {
@@ -156,8 +175,10 @@ export async function* streamOpenAIChatToAnthropicSse(
     } else {
       for (const event of sse.emit_error(errorMessage)) yield event;
     }
-    yield sse.message_delta("end_turn", 1);
-    yield sse.message_stop();
+    if (!options?.skipMessageLifecycle) {
+        yield sse.message_delta("end_turn", 1);
+        yield sse.message_stop();
+    }
     return;
   }
 
@@ -213,8 +234,10 @@ export async function* streamOpenAIChatToAnthropicSse(
       ? usageInfo.completion_tokens
       : sse.estimate_output_tokens();
 
-  yield sse.message_delta(mapStopReason(finishReason), completion);
-  yield sse.message_stop();
+  if (!options?.skipMessageLifecycle) {
+    yield sse.message_delta(mapStopReason(finishReason), completion);
+    yield sse.message_stop();
+  }
 }
 
 function* processToolCall(

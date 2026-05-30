@@ -353,4 +353,48 @@ describe("streamOpenAIChatToAnthropicSse", () => {
     expect(output).toContain("WebFetch");
     expect(output).toContain("example.com");
   });
+  it("skips message_start/message_delta/message_stop when skipMessageLifecycle is set", async () => {
+    const chunks: StreamChunk[] = [
+      { choices: [{ delta: { content: "Hello" }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ];
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      chunksToStream(chunks),
+      TEST_REQUEST,
+      10,
+      true,
+      undefined,
+      undefined,
+      { skipMessageLifecycle: true },
+    );
+
+    const output = await collectStream(stream);
+    expect(output).not.toContain("event: message_start");
+    expect(output).not.toContain("event: message_stop");
+    expect(output).not.toContain("event: message_delta");
+    expect(output).toContain("event: content_block_start");
+    expect(output).toContain("Hello");
+  });
+
+  it("uses startingBlockIndex to offset content block indices", async () => {
+    const chunks: StreamChunk[] = [
+      { choices: [{ delta: { content: "Hello" }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ];
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      chunksToStream(chunks),
+      TEST_REQUEST,
+      10,
+      true,
+      undefined,
+      undefined,
+      { skipMessageLifecycle: true, startingBlockIndex: 3 },
+    );
+
+    const output = await collectStream(stream);
+    // The text block should start at index 3, not 0
+    expect(output).toContain('"index":3');
+  });
 });

@@ -43,7 +43,7 @@ export interface DumpTiming {
 }
 
 export interface ServerToolLogEntry {
-  tool: "web_search" | "web_fetch";
+  tool: "web_search" | "web_fetch" | "agentic_loop";
   timestamp: string;
   /** For web_search: the query string. For web_fetch: the target URL. */
   input: string;

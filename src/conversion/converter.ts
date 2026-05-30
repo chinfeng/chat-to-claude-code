@@ -1,5 +1,7 @@
 /** Anthropic Messages API → OpenAI Chat Completions API conversion. */
 
+import { isServerToolType, buildServerToolFunctionSchema, buildServerToolSystemPromptSuffix } from "../server/server_tools.js";
+
 export class OpenAIConversionError extends Error {
   constructor(message: string) {
     super(message);
@@ -446,14 +448,16 @@ export class AnthropicToOpenAIConverter {
   static convertTools(
     tools: Record<string, unknown>[],
   ): Record<string, unknown>[] {
-    return tools.map((tool) => ({
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description || "",
-        parameters: toolInputSchema(tool),
-      },
-    }));
+    return tools
+      .filter((tool) => !isServerToolType(String(tool.type ?? "")))
+      .map((tool) => ({
+        type: "function",
+        function: {
+          name: tool.name,
+          description: tool.description || "",
+          parameters: toolInputSchema(tool),
+        },
+      }));
   }
 
   static convertToolChoice(toolChoice: unknown): unknown {
@@ -521,9 +525,19 @@ export function buildBaseRequestBody(
   );
 
   const system = requestData.system;
+  const serverTools = requestData.server_tools;
+  const serverToolPrompt = serverTools?.length ? buildServerToolSystemPromptSuffix(serverTools) : "";
+
   if (system) {
     const systemMsg = AnthropicToOpenAIConverter.convertSystemPrompt(system);
-    if (systemMsg) messages.unshift(systemMsg);
+    if (systemMsg) {
+      if (serverToolPrompt) {
+        systemMsg.content = String(systemMsg.content) + "\n\n" + serverToolPrompt;
+      }
+      messages.unshift(systemMsg);
+    }
+  } else if (serverToolPrompt) {
+    messages.unshift({ role: "system", content: serverToolPrompt });
   }
 
   const body: Record<string, unknown> = { model: requestData.model, messages };
@@ -541,8 +555,21 @@ export function buildBaseRequestBody(
   if (stopSequences && stopSequences.length) body.stop = stopSequences;
 
   const tools = requestData.tools;
+  // Build server tool function schemas
+  const serverToolSchemas: Record<string, unknown>[] = [];
+  if (serverTools?.length) {
+    for (const st of serverTools) {
+      const schema = buildServerToolFunctionSchema(String(st.type ?? ""), String(st.name ?? ""));
+      if (schema) serverToolSchemas.push(schema);
+    }
+  }
+
   if (tools && tools.length) {
-    body.tools = AnthropicToOpenAIConverter.convertTools(tools);
+    const regularTools = AnthropicToOpenAIConverter.convertTools(tools);
+    const allTools = [...regularTools, ...serverToolSchemas];
+    if (allTools.length) body.tools = allTools;
+  } else if (serverToolSchemas.length) {
+    body.tools = serverToolSchemas;
   }
 
   const toolChoice = requestData.tool_choice;

@@ -335,3 +335,101 @@ describe("buildBaseRequestBody", () => {
     expect("max_tokens" in body).toBe(false);
   });
 });
+
+describe("AnthropicToOpenAIConverter.convertTools with server tools", () => {
+  it("skips web_search_20250305 type tools from conversion", () => {
+    const tools = [
+      { type: "web_search_20250305", name: "web_search", max_uses: 8 },
+      { type: "custom", name: "read_file", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+    ];
+    const result = AnthropicToOpenAIConverter.convertTools(tools);
+    expect(result.length).toBe(1);
+    expect(result[0]).toEqual({
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "",
+        parameters: { type: "object", properties: { path: { type: "string" } } },
+      },
+    });
+  });
+
+  it("skips web_fetch_20250305 type tools from conversion", () => {
+    const tools = [
+      { type: "web_fetch_20250305", name: "web_fetch" },
+    ];
+    const result = AnthropicToOpenAIConverter.convertTools(tools);
+    expect(result.length).toBe(0);
+  });
+
+  it("converts regular tools normally", () => {
+    const tools = [
+      { name: "bash", description: "Run a bash command", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
+    ];
+    const result = AnthropicToOpenAIConverter.convertTools(tools);
+    expect(result.length).toBe(1);
+    expect(result[0].function.name).toBe("bash");
+  });
+});
+
+describe("buildBaseRequestBody with server tools", () => {
+  it("injects server tool function schemas into tools array", () => {
+    const requestData: RequestData = {
+      model: "test-model",
+      messages: [{ role: "user", content: "search the web" }],
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
+      server_tools: [{ type: "web_search_20250305", name: "web_search" }],
+    };
+    const body = buildBaseRequestBody(requestData, 4096);
+    const tools = body.tools as Record<string, unknown>[];
+    expect(tools.length).toBe(1);
+    expect(tools[0]).toEqual({
+      type: "function",
+      function: {
+        name: "web_search",
+        description: "Search the web for information. Use this tool when you need to find current information, look up facts, or research topics on the internet.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query string",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    });
+  });
+
+  it("injects server tool usage instructions into system prompt", () => {
+    const requestData: RequestData = {
+      model: "test-model",
+      messages: [{ role: "user", content: "search the web" }],
+      system: [{ type: "text", text: "You are a helpful assistant." }],
+      server_tools: [{ type: "web_search_20250305", name: "web_search" }],
+    };
+    const body = buildBaseRequestBody(requestData, 4096);
+    const messages = body.messages as Record<string, unknown>[];
+    const systemMsg = messages.find((m) => m.role === "system");
+    expect(systemMsg).toBeDefined();
+    const content = String(systemMsg!.content);
+    expect(content).toContain("You are a helpful assistant.");
+    expect(content).toContain("web_search");
+  });
+
+  it("combines regular tools with server tool schemas", () => {
+    const requestData: RequestData = {
+      model: "test-model",
+      messages: [{ role: "user", content: "test" }],
+      tools: [
+        { type: "web_search_20250305", name: "web_search", max_uses: 8 },
+        { name: "bash", description: "Run command", input_schema: { type: "object", properties: { command: { type: "string" } } } },
+      ],
+      server_tools: [{ type: "web_search_20250305", name: "web_search" }],
+    };
+    const body = buildBaseRequestBody(requestData, 4096);
+    const tools = body.tools as Record<string, unknown>[];
+    expect(tools.length).toBe(2);
+  });
+});
