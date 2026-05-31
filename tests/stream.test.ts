@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { streamOpenAIChatToAnthropicSse } from "../src/transport/stream.js";
+import { streamOpenAIChatToAnthropicSse, inferToolNameByIndex } from "../src/transport/stream.js";
 import type { StreamChunk } from "../src/transport/stream.js";
 import type { RequestData } from "../src/conversion/converter.js";
 import { ThinkTagParser } from "../src/parsers/think_tag_parser.js";
@@ -396,5 +396,171 @@ describe("streamOpenAIChatToAnthropicSse", () => {
     const output = await collectStream(stream);
     // The text block should start at index 3, not 0
     expect(output).toContain('"index":3');
+  });
+
+  it("handles tool_calls with missing name and id (GLM-5.1 incomplete tool_calls)", async () => {
+    // GLM-5.1 via newapi proxy sometimes returns tool_calls with only
+    // index and arguments, missing both id and function.name.
+    // When request.tools is available, the proxy should infer the tool
+    // name from the tools list (by index) and generate a valid tool_use block.
+    const chunks: StreamChunk[] = [
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              // id and function.name are MISSING — this is the bug scenario
+              function: { arguments: "{}" },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+      },
+    ];
+
+    const requestWithTools: RequestData = {
+      model: "z-ai/glm-5.1",
+      messages: [{ role: "user", content: "Hello" }],
+      tools: [
+        { type: "custom", name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } },
+      ],
+    };
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      chunksToStream(chunks),
+      requestWithTools,
+      10,
+      true,
+    );
+
+    const output = await collectStream(stream);
+    // Should produce a valid tool_use block with the inferred name
+    expect(output).toContain('"type":"tool_use"');
+    expect(output).toContain("Read");
+    expect(output).toContain("tool_use"); // stop_reason
+  });
+
+  it("gracefully degrades when tool_calls missing name and no tools list available", async () => {
+    // When tool_calls has no name and request.tools is not available,
+    // the proxy should NOT emit stop_reason: "tool_use" (which would cause
+    // Claude Code to fail). Instead, it should degrade to end_turn.
+    const chunks: StreamChunk[] = [
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              function: { arguments: "{}" },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+      },
+    ];
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      chunksToStream(chunks),
+      TEST_REQUEST, // no tools
+      10,
+      true,
+    );
+
+    const output = await collectStream(stream);
+    // Should NOT have tool_use stop_reason since no tool_use block was emitted
+    expect(output).not.toContain('"stop_reason":"tool_use"');
+    // Should degrade gracefully to end_turn
+    expect(output).toContain("end_turn");
+  });
+
+  it("handles tool_calls with missing name but text content present (GLM-5.1 pattern)", async () => {
+    // Session 2 from the dump: model outputs text first, then an incomplete tool_call
+    const chunks: StreamChunk[] = [
+      { choices: [{ delta: { content: "让我", tool_calls: [] }, finish_reason: null }] },
+      { choices: [{ delta: { content: "用 Chrome DevTools 截图查看当前页面状态", tool_calls: [] }, finish_reason: null }] },
+      { choices: [{ delta: { content: "：", tool_calls: [] }, finish_reason: null }] },
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              function: { arguments: "{}" },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+      },
+    ];
+
+    const requestWithTools: RequestData = {
+      model: "z-ai/glm-5.1",
+      messages: [{ role: "user", content: "Hello" }],
+      tools: [
+        { type: "custom", name: "chrome-devtools-mcp:chrome-devtools", description: "Chrome DevTools", input_schema: { type: "object", properties: {} } },
+      ],
+    };
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      chunksToStream(chunks),
+      requestWithTools,
+      10,
+      true,
+    );
+
+    const output = await collectStream(stream);
+    // Text must appear before tool_use
+    const textBlockStart = output.indexOf('"type":"text"');
+    const toolUseBlockStart = output.indexOf('"type":"tool_use"');
+    expect(textBlockStart).toBeGreaterThan(-1);
+    expect(toolUseBlockStart).toBeGreaterThan(-1);
+    expect(textBlockStart).toBeLessThan(toolUseBlockStart);
+    expect(output).toContain("Chrome DevTools");
+    expect(output).toContain("chrome-devtools-mcp:chrome-devtools");
+  });
+});
+
+describe("inferToolNameByIndex", () => {
+  const baseRequest: RequestData = {
+    model: "z-ai/glm-5.1",
+    messages: [{ role: "user", content: "Hello" }],
+  };
+
+  it("returns tool name from tools list by index", () => {
+    const request: RequestData = {
+      ...baseRequest,
+      tools: [
+        { type: "custom", name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } },
+        { type: "custom", name: "Write", description: "Write a file", input_schema: { type: "object", properties: {} } },
+      ],
+    };
+    expect(inferToolNameByIndex(request, 0)).toBe("Read");
+    expect(inferToolNameByIndex(request, 1)).toBe("Write");
+  });
+
+  it("returns null when toolIndex is out of bounds", () => {
+    const request: RequestData = {
+      ...baseRequest,
+      tools: [
+        { type: "custom", name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } },
+      ],
+    };
+    expect(inferToolNameByIndex(request, 1)).toBeNull();
+    expect(inferToolNameByIndex(request, 99)).toBeNull();
+  });
+
+  it("returns null when tools list is empty or missing", () => {
+    expect(inferToolNameByIndex(baseRequest, 0)).toBeNull();
+    expect(inferToolNameByIndex({ ...baseRequest, tools: [] }, 0)).toBeNull();
+  });
+
+  it("returns null when tool name is empty or not a string", () => {
+    const request: RequestData = {
+      ...baseRequest,
+      tools: [
+        { type: "custom", name: "", description: "Empty name", input_schema: { type: "object", properties: {} } },
+        { type: "custom", name: 42 as unknown as string, description: "Number name", input_schema: { type: "object", properties: {} } },
+      ],
+    };
+    expect(inferToolNameByIndex(request, 0)).toBeNull();
+    expect(inferToolNameByIndex(request, 1)).toBeNull();
   });
 });

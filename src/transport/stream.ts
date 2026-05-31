@@ -58,11 +58,11 @@ function isThinkingEnabled(request: RequestData, hint?: boolean | null): boolean
 
 export interface StreamOptions {
   /** Skip emitting message_start/message_delta/message_stop events.
-   *  Used when the agentic loop already emitted message_start and will
-   *  handle the message lifecycle events. */
+   * Used when the agentic loop already emitted message_start and will
+   * handle the message lifecycle events. */
   skipMessageLifecycle?: boolean;
   /** Starting block index for content blocks. Used when server_tool_use
-   *  blocks have already been emitted before this stream starts. */
+   * blocks have already been emitted before this stream starts. */
   startingBlockIndex?: number;
 }
 
@@ -176,8 +176,8 @@ export async function* streamOpenAIChatToAnthropicSse(
       for (const event of sse.emit_error(errorMessage)) yield event;
     }
     if (!options?.skipMessageLifecycle) {
-        yield sse.message_delta("end_turn", 1);
-        yield sse.message_stop();
+      yield sse.message_delta("end_turn", 1);
+      yield sse.message_stop();
     }
     return;
   }
@@ -203,6 +203,36 @@ export async function* streamOpenAIChatToAnthropicSse(
   }
   for (const toolUse of heuristicFlush.tools) {
     for (const event of iterHeuristicToolUseSse(sse, toolUse)) yield event;
+  }
+
+  // Resolve orphaned tool states — tool_calls that arrived without a name/id.
+  // This happens with some upstream providers (e.g. GLM-5.1 via newapi) that
+  // emit tool_calls chunks with only index and arguments, missing function.name
+  // and id. We try to infer the name from request.tools (by index), or discard
+  // the orphaned state and downgrade stop_reason from "tool_use" to "end_turn".
+  let hasOrphanedToolStates = false;
+  for (const [toolIndex, state] of sse.blocks.toolStates) {
+    if (state.started) continue; // already started — not orphaned
+    if (!state.preStartArgs && !state.name) continue; // no data — ignore
+
+    // Try to infer tool name from request.tools by index
+    const inferredName = inferToolNameByIndex(request, toolIndex);
+    if (inferredName) {
+      // We can infer the name — start the tool block now
+      const resolvedId = state.toolId || `tool_${randomUUID()}`;
+      for (const event of sse.close_content_blocks()) yield event;
+      yield sse.start_tool_block(toolIndex, resolvedId, inferredName);
+      if (state.preStartArgs) {
+        yield sse.emit_tool_delta(toolIndex, state.preStartArgs);
+        state.preStartArgs = "";
+      }
+    } else {
+      // Cannot infer — mark as orphaned so we downgrade stop_reason later
+      hasOrphanedToolStates = true;
+      // Clear the orphaned state so it doesn't interfere with hasStartedTool
+      state.preStartArgs = "";
+      sse.blocks.toolStates.delete(toolIndex);
+    }
   }
 
   // Ensure at least one content block exists
@@ -231,13 +261,41 @@ export async function* streamOpenAIChatToAnthropicSse(
 
   const completion =
     usageInfo && typeof usageInfo.completion_tokens === "number"
-      ? usageInfo.completion_tokens
-      : sse.estimate_output_tokens();
+    ? usageInfo.completion_tokens
+    : sse.estimate_output_tokens();
+
+  // If we had orphaned tool states (tool_calls without names that couldn't be
+  // resolved), downgrade stop_reason from "tool_use" to "end_turn" so that
+  // Claude Code doesn't fail trying to parse a non-existent tool_use block.
+  const effectiveFinishReason = hasOrphanedToolStates ? "stop" : finishReason;
 
   if (!options?.skipMessageLifecycle) {
-    yield sse.message_delta(mapStopReason(finishReason), completion);
+    yield sse.message_delta(mapStopReason(effectiveFinishReason), completion);
     yield sse.message_stop();
   }
+}
+
+/** Try to infer a tool name from the request's tools list by tool call index.
+ * Returns the tool name if found, or null if inference is not possible.
+ *
+ * When upstream providers (e.g. GLM-5.1 via newapi) return tool_calls without
+ * a function.name, we attempt to resolve it by matching the tool_call index
+ * to the position in the tools array that was sent to the upstream API. */
+export function inferToolNameByIndex(request: RequestData, toolIndex: number): string | null {
+  const tools = request.tools;
+  if (!tools || !tools.length) return null;
+
+  // The tool call index corresponds to the position in the tools array
+  // that was sent to the upstream API. After conversion from Anthropic to
+  // OpenAI format, tools are in the same order, so index 0 = first tool, etc.
+  if (toolIndex < tools.length) {
+    const tool = tools[toolIndex];
+    const name = tool.name;
+    if (typeof name === "string" && name.trim()) {
+      return name.trim();
+    }
+  }
+  return null;
 }
 
 function* processToolCall(
