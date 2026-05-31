@@ -19,6 +19,9 @@ import {
   formatWebFetchResultContent,
   buildServerToolFunctionSchema,
   buildServerToolSystemPromptSuffix,
+  detectServerToolInText,
+  stripToolUseFromText,
+  type DetectedTextToolCall,
 } from "./server_tools.js";
 
 /** Whether passthrough mode is active: no upstream key and no downstream auth token. */
@@ -744,80 +747,169 @@ async function handleServerToolRequest(
             chunks as AsyncIterable<StreamChunk>,
         );
 
-        // Check if any tool calls are server tools that we should intercept
-        const serverToolCalls = collectResult.toolCalls.filter((tc) =>
-            isServerToolCall(tc.name, config.serverTools)
-        );
+ // Check if any tool calls are server tools that we should intercept
+ // Path A: Standard OpenAI tool_calls in the response
+ const serverToolCalls = collectResult.toolCalls.filter((tc) =>
+ isServerToolCall(tc.name, config.serverTools)
+ );
 
-        if (serverToolCalls.length === 0 || collectResult.finishReason !== "tool_calls") {
-            // No more server tool calls — this is the final text response
-            break;
-        }
+ // Path B: Fallback — detect tool calls embedded in text content
+ // Some models (e.g. GLM) don't use the tool_calls protocol; instead they
+ // emit <tool_use>{"name":"web_search","input":{...}}</tool_use> in the
+ // text stream. We detect these and synthesize tool call entries.
+ let textToolCalls: DetectedTextToolCall[] = [];
+ if (serverToolCalls.length === 0 && collectResult.textContent) {
+ textToolCalls = detectServerToolInText(collectResult.textContent);
+ if (textToolCalls.length > 0) {
+ dump.logServerTool({
+ tool: "agentic_loop",
+ timestamp: new Date().toISOString(),
+ input: `detected ${textToolCalls.length} text-embedded tool call(s): ${textToolCalls.map((tc) => tc.type).join(", ")}`,
+ engine: "text_fallback",
+ durationMs: Date.now() - requestStartMs,
+ });
+ }
+ }
 
-        // Execute server tool calls and append to message history
-        const assistantToolCalls = collectResult.toolCalls.map((tc) => ({
-            id: tc.id,
-            type: "function" as const,
-            function: { name: tc.name, arguments: tc.arguments },
-        }));
+ // If neither path found server tool calls, this is the final text response
+ if (serverToolCalls.length === 0 && textToolCalls.length === 0) {
+ break;
+ }
 
-        upstreamMessages.push({
-            role: "assistant",
-            content: collectResult.textContent || null,
-            tool_calls: assistantToolCalls,
-        });
+ // --- Execute standard (OpenAI protocol) server tool calls ---
+ if (serverToolCalls.length > 0) {
+ const assistantToolCalls = collectResult.toolCalls.map((tc) => ({
+ id: tc.id,
+ type: "function" as const,
+ function: { name: tc.name, arguments: tc.arguments },
+ }));
 
-        for (const tc of collectResult.toolCalls) {
-            if (isServerToolCall(tc.name, config.serverTools)) {
-                const toolResult = await executeServerToolCall(
-                    tc.name, tc.arguments, config.serverTools, onLog,
-                );
+ upstreamMessages.push({
+ role: "assistant",
+ content: collectResult.textContent || null,
+ tool_calls: assistantToolCalls,
+ });
 
-                const toolUseId = tc.id || `srvtool_${randomUUID().slice(0, 12)}`;
-                let input: Record<string, unknown>;
-                try { input = JSON.parse(tc.arguments); } catch { input = {}; }
+ for (const tc of collectResult.toolCalls) {
+ if (isServerToolCall(tc.name, config.serverTools)) {
+ const toolResult = await executeServerToolCall(
+ tc.name, tc.arguments, config.serverTools, onLog,
+ );
 
-                serverToolEvents.push({
-                    type: "server_tool_use",
-                    toolUseId,
-                    toolName: tc.name,
-                    input,
-                });
+ const toolUseId = tc.id || `srvtool_${randomUUID().slice(0, 12)}`;
+ let input: Record<string, unknown>;
+ try { input = JSON.parse(tc.arguments); } catch { input = {}; }
 
-                let contentBlocks: Record<string, unknown>[];
-                try { contentBlocks = JSON.parse(toolResult.content); } catch { contentBlocks = []; }
+ serverToolEvents.push({
+ type: "server_tool_use",
+ toolUseId,
+ toolName: tc.name,
+ input,
+ });
 
-                if (tc.name === "web_search") {
-                    serverToolEvents.push({
-                        type: "web_search_tool_result",
-                        toolUseId,
-                        content: contentBlocks,
-                    });
-                } else if (tc.name === "web_fetch") {
-                    const hasError = contentBlocks.some(
-                        (b) => b.type === "text" && typeof b.text === "string" && b.text.startsWith("Status: 4")
-                    );
-                    serverToolEvents.push({
-                        type: "web_fetch_tool_result",
-                        toolUseId,
-                        content: contentBlocks,
-                        status: hasError ? "error" : undefined,
-                    });
-                }
+ let contentBlocks: Record<string, unknown>[];
+ try { contentBlocks = JSON.parse(toolResult.content); } catch { contentBlocks = []; }
 
-                upstreamMessages.push({
-                    role: "tool",
-                    tool_call_id: tc.id,
-                    content: toolResult.content,
-                });
-            } else {
-                upstreamMessages.push({
-                    role: "tool",
-                    tool_call_id: tc.id,
-                    content: "Tool execution not supported in server tool mode.",
-                });
-            }
-        }
+ if (tc.name === "web_search") {
+ serverToolEvents.push({
+ type: "web_search_tool_result",
+ toolUseId,
+ content: contentBlocks,
+ });
+ } else if (tc.name === "web_fetch") {
+ const hasError = contentBlocks.some(
+ (b) => b.type === "text" && typeof b.text === "string" && b.text.startsWith("Status: 4")
+ );
+ serverToolEvents.push({
+ type: "web_fetch_tool_result",
+ toolUseId,
+ content: contentBlocks,
+ status: hasError ? "error" : undefined,
+ });
+ }
+
+ upstreamMessages.push({
+ role: "tool",
+ tool_call_id: tc.id,
+ content: toolResult.content,
+ });
+ } else {
+ upstreamMessages.push({
+ role: "tool",
+ tool_call_id: tc.id,
+ content: "Tool execution not supported in server tool mode.",
+ });
+ }
+ }
+ }
+
+ // --- Execute text-embedded (fallback) server tool calls ---
+ if (textToolCalls.length > 0) {
+ // The model output tool_use tags inline in its text, then continued
+ // with hallucinated "results". We strip the tool_use tags and everything
+ // after them from the assistant message, then inject real tool results.
+ const cleanText = stripToolUseFromText(collectResult.textContent);
+ const synthesizeToolCalls: { id: string; type: "function"; function: { name: string; arguments: string } }[] = [];
+
+ for (const tc of textToolCalls) {
+ const fakeId = `srvtool_${randomUUID().slice(0, 12)}`;
+ const argsJson = JSON.stringify(tc.input);
+ synthesizeToolCalls.push({
+ id: fakeId,
+ type: "function",
+ function: { name: tc.type, arguments: argsJson },
+ });
+ }
+
+ upstreamMessages.push({
+ role: "assistant",
+ content: cleanText || null,
+ tool_calls: synthesizeToolCalls,
+ });
+
+ for (let i = 0; i < textToolCalls.length; i++) {
+ const tc = textToolCalls[i];
+ const fakeId = synthesizeToolCalls[i].id;
+
+ const toolResult = await executeServerToolCall(
+ tc.type, JSON.stringify(tc.input), config.serverTools, onLog,
+ );
+
+ serverToolEvents.push({
+ type: "server_tool_use",
+ toolUseId: fakeId,
+ toolName: tc.type,
+ input: tc.input,
+ });
+
+ let contentBlocks: Record<string, unknown>[];
+ try { contentBlocks = JSON.parse(toolResult.content); } catch { contentBlocks = []; }
+
+ if (tc.type === "web_search") {
+ serverToolEvents.push({
+ type: "web_search_tool_result",
+ toolUseId: fakeId,
+ content: contentBlocks,
+ });
+ } else if (tc.type === "web_fetch") {
+ const hasError = contentBlocks.some(
+ (b) => b.type === "text" && typeof b.text === "string" && b.text.startsWith("Status: 4")
+ );
+ serverToolEvents.push({
+ type: "web_fetch_tool_result",
+ toolUseId: fakeId,
+ content: contentBlocks,
+ status: hasError ? "error" : undefined,
+ });
+ }
+
+ upstreamMessages.push({
+ role: "tool",
+ tool_call_id: fakeId,
+ content: toolResult.content,
+ });
+ }
+ }
     }
 
     // === Final upstream request to get streaming text response ===

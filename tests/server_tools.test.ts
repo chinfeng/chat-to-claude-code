@@ -6,6 +6,7 @@ import {
   formatWebSearchResultContent,
   formatWebFetchResultContent,
   detectServerToolInText,
+  stripToolUseFromText,
   buildServerToolFunctionSchema,
   buildServerToolSystemPromptSuffix,
   isServerToolType,
@@ -139,47 +140,125 @@ describe("formatWebFetchResultContent", () => {
 });
 
 describe("detectServerToolInText", () => {
+  // --- Pattern 1: <tool_use> XML tags ---
+
+  it("detects <tool_use> web_search tag", () => {
+    const text = 'I\'ll search for that.\n\n<tool_use>\n{"name": "web_search", "input": {"query": "react-router v7 best practices"}}\n</tool_use>';
+    const results = detectServerToolInText(text);
+    expect(results.length).toBe(1);
+    expect(results[0].type).toBe("web_search");
+    expect(results[0].input.query).toBe("react-router v7 best practices");
+  });
+
+  it("detects <tool_use> web_fetch tag", () => {
+    const text = '<tool_use>\n{"name": "web_fetch", "input": {"url": "https://example.com"}}\n</tool_use>';
+    const results = detectServerToolInText(text);
+    expect(results.length).toBe(1);
+    expect(results[0].type).toBe("web_fetch");
+    expect(results[0].input.url).toBe("https://example.com");
+  });
+
+  it("detects <tool_use> with prompt field for web_fetch", () => {
+    const text = '<tool_use>\n{"name": "web_fetch", "input": {"url": "https://example.com", "prompt": "summarize"}}\n</tool_use>';
+    const results = detectServerToolInText(text);
+    expect(results.length).toBe(1);
+    expect(results[0].type).toBe("web_fetch");
+    expect(results[0].input.url).toBe("https://example.com");
+    expect(results[0].input.prompt).toBe("summarize");
+  });
+
+  it("detects multiple <tool_use> tags in same text", () => {
+    const text = '<tool_use>\n{"name": "web_search", "input": {"query": "first query"}}\n</tool_use>\nSome text\n<tool_use>\n{"name": "web_fetch", "input": {"url": "https://example.com"}}\n</tool_use>';
+    const results = detectServerToolInText(text);
+    expect(results.length).toBe(2);
+    expect(results[0].type).toBe("web_search");
+    expect(results[1].type).toBe("web_fetch");
+  });
+
+  it("ignores <tool_use> tags for non-server tools", () => {
+    const text = '<tool_use>\n{"name": "read_file", "input": {"path": "/tmp/test"}}\n</tool_use>';
+    const results = detectServerToolInText(text);
+    expect(results.length).toBe(0);
+  });
+
+  // --- Pattern 2: WebSearch/WebFetch natural language ---
+
   it("detects WebSearch with query", () => {
-    const result = detectServerToolInText('WebSearch {"query": "test query"}');
-    expect(result).not.toBeNull();
-    expect(result!.type).toBe("web_search");
-    expect((result!.input as Record<string, unknown>).query).toBe("test query");
+    const results = detectServerToolInText('WebSearch {"query": "test query"}');
+    expect(results.length).toBe(1);
+    expect(results[0].type).toBe("web_search");
+    expect(results[0].input.query).toBe("test query");
   });
 
   it("detects WebFetch with url", () => {
-    const result = detectServerToolInText('WebFetch {"url": "https://example.com"}');
-    expect(result).not.toBeNull();
-    expect(result!.type).toBe("web_fetch");
-    expect((result!.input as Record<string, unknown>).url).toBe("https://example.com");
+    const results = detectServerToolInText('WebFetch {"url": "https://example.com"}');
+    expect(results.length).toBe(1);
+    expect(results[0].type).toBe("web_fetch");
+    expect(results[0].input.url).toBe("https://example.com");
   });
 
-  it("returns null for non-server-tool text", () => {
-    expect(detectServerToolInText("Hello world")).toBeNull();
-    expect(detectServerToolInText('{"query": "test"}')).toBeNull();
+  it("returns empty array for non-server-tool text", () => {
+    expect(detectServerToolInText("Hello world")).toEqual([]);
+    expect(detectServerToolInText('{"query": "test"}')).toEqual([]);
   });
 
   it("detects WebSearch case-insensitively", () => {
-    const result = detectServerToolInText('websearch {"query": "test"}');
-    expect(result).not.toBeNull();
-    expect(result!.type).toBe("web_search");
+    const results = detectServerToolInText('websearch {"query": "test"}');
+    expect(results.length).toBe(1);
+    expect(results[0].type).toBe("web_search");
   });
 
   it("detects WebSearch with extra text around it", () => {
-    const result = detectServerToolInText('Let me search for that. WebSearch {"query": "latest news"}');
-    expect(result).not.toBeNull();
-    expect(result!.type).toBe("web_search");
+    const results = detectServerToolInText('Let me search for that. WebSearch {"query": "latest news"}');
+    expect(results.length).toBe(1);
+    expect(results[0].type).toBe("web_search");
   });
 
-  it("returns null for malformed JSON", () => {
-    expect(detectServerToolInText("WebSearch {broken")).toBeNull();
+  it("returns empty array for malformed JSON", () => {
+    expect(detectServerToolInText("WebSearch {broken")).toEqual([]);
   });
 
-  it("returns null for WebSearch without query", () => {
-    expect(detectServerToolInText('WebSearch {"other": "value"}')).toBeNull();
+  it("returns empty array for WebSearch without query", () => {
+    expect(detectServerToolInText('WebSearch {"other": "value"}')).toEqual([]);
   });
 
-  it("returns null for WebFetch without url", () => {
-    expect(detectServerToolInText('WebFetch {"other": "value"}')).toBeNull();
+  it("returns empty array for WebFetch without url", () => {
+    expect(detectServerToolInText('WebFetch {"other": "value"}')).toEqual([]);
+  });
+
+  // --- Real-world GLM-5.1 output test ---
+
+  it("detects tool call from GLM-style <tool_use> output with hallucinated continuation", () => {
+    const text = "I'll search for React Router v7 best practices for you.\n\n<tool_use>\n{\"name\": \"web_search\", \"input\": {\"query\": \"react-router v7 最佳实践 best practices\"}}\n</tool_use>\n\nBased on my search, here's a summary of React Router v7 best practices:\n\n---\n\n## React Router v7 Best Practices\n\n### 1. **Framework Mode vs Library Mode**";
+    const results = detectServerToolInText(text);
+    expect(results.length).toBe(1);
+    expect(results[0].type).toBe("web_search");
+    expect(results[0].input.query).toBe("react-router v7 最佳实践 best practices");
+  });
+});
+
+describe("stripToolUseFromText", () => {
+  it("strips <tool_use> and everything after it", () => {
+    const text = "I'll search for that.\n\n<tool_use>\n{\"name\": \"web_search\", \"input\": {\"query\": \"test\"}}\n</tool_use>\n\nBased on my search, here are the results...";
+    const result = stripToolUseFromText(text);
+    expect(result).toBe("I'll search for that.");
+  });
+
+  it("returns original text when no <tool_use> tag", () => {
+    const text = "Just a normal response without tool calls.";
+    expect(stripToolUseFromText(text)).toBe(text);
+  });
+
+  it("handles text that starts with <tool_use>", () => {
+    const text = '<tool_use>\n{"name": "web_search", "input": {"query": "test"}}\n</tool_use>\nHallucinated results';
+    const result = stripToolUseFromText(text);
+    expect(result).toBe("");
+  });
+
+  it("strips trailing whitespace before tool_use", () => {
+    const text = "Some text  \n\n<tool_use>\n...\n</tool_use>";
+    const result = stripToolUseFromText(text);
+    expect(result).toBe("Some text");
   });
 });
 

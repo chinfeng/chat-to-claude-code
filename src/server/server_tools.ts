@@ -308,17 +308,46 @@ export function formatWebFetchResultContent(
   return blocks;
 }
 
-/** Detect web_search or web_fetch tool calls in upstream text output. */
+/** Detected server tool call from text. */
+export interface DetectedTextToolCall {
+  type: "web_search" | "web_fetch";
+  input: Record<string, unknown>;
+}
+
+/** Detect web_search or web_fetch tool calls in upstream text output.
+ *  Supports three patterns:
+ *  1. `<tool_use>{"name": "web_search", "input": {"query": "..."}}</tool_use>`  (Claude-style XML tags)
+ *  2. `WebSearch {"query": "..."}` / `WebFetch {"url": "..."}`                (natural language)
+ *  Returns an array (may be empty if no tool calls found).
+ */
 export function detectServerToolInText(
   text: string,
-): { type: "web_search" | "web_fetch"; input: Record<string, unknown> } | null {
-  // Match patterns like: WebSearch {"query": "..."} or WebFetch {"url": "..."}
+): DetectedTextToolCall[] {
+  const results: DetectedTextToolCall[] = [];
+
+  // Pattern 1: <tool_use>{"name": "web_search", "input": {...}}</tool_use>
+  const toolUseRe = /<tool_use>\s*(\{[\s\S]*?\})\s*<\/tool_use>/g;
+  let match: RegExpExecArray | null;
+  while ((match = toolUseRe.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (parsed.name === "web_search" && parsed.input?.query) {
+        results.push({ type: "web_search", input: parsed.input as Record<string, unknown> });
+      } else if (parsed.name === "web_fetch" && parsed.input?.url) {
+        results.push({ type: "web_fetch", input: parsed.input as Record<string, unknown> });
+      }
+    } catch {}
+  }
+
+  // Pattern 2: WebSearch {"query": "..."} or WebFetch {"url": "..."}
   const searchMatch = text.match(/\bWebSearch\s*\{[^}]*"query"\s*:\s*"[^"]*"[^}]*\}/i);
   if (searchMatch) {
     try {
       const jsonStr = searchMatch[0].replace(/^\s*WebSearch\s*/i, "");
       const input = JSON.parse(jsonStr);
-      if (input.query) return { type: "web_search", input };
+      if (input.query && !results.some((r) => r.type === "web_search" && r.input.query === input.query)) {
+        results.push({ type: "web_search", input });
+      }
     } catch {}
   }
 
@@ -327,21 +356,35 @@ export function detectServerToolInText(
     try {
       const jsonStr = fetchMatch[0].replace(/^\s*WebFetch\s*/i, "");
       const input = JSON.parse(jsonStr);
-      if (input.url) return { type: "web_fetch", input };
+      if (input.url && !results.some((r) => r.type === "web_fetch" && r.input.url === input.url)) {
+        results.push({ type: "web_fetch", input });
+      }
     } catch {}
   }
 
-  return null;
+  return results;
+}
+
+/** Strip <tool_use>...</tool_use> blocks and any hallucinated text after them from model output.
+ *  When a model emits a tool_use in text but then continues with fake "results",
+ *  we need to remove both the tag and the hallucinated continuation.
+ *  Returns the clean text that precedes the first tool_use tag.
+ */
+export function stripToolUseFromText(text: string): string {
+  const idx = text.indexOf("<tool_use>");
+  if (idx === -1) return text;
+  // Keep text before the tool_use tag, strip trailing whitespace
+  return text.slice(0, idx).replace(/\s+$/, "");
 }
 
 /** Check if a tool type string is an Anthropic server tool type. */
 export function isServerToolType(type: string): boolean {
   return type === "web_search" || type.startsWith("web_search_") ||
-         type === "web_fetch" || type.startsWith("web_fetch_");
+    type === "web_fetch" || type.startsWith("web_fetch_");
 }
 
 /** Build an OpenAI-compatible function schema for a server tool.
- *  Returns null if the type is not a recognized server tool. */
+ * Returns null if the type is not a recognized server tool. */
 export function buildServerToolFunctionSchema(
   toolType: string,
   toolName: string,
@@ -392,7 +435,7 @@ export function buildServerToolFunctionSchema(
 }
 
 /** Build a system prompt suffix that instructs the upstream model how to use server tools.
- *  This is injected into the system prompt when server tools are present. */
+ * This is injected into the system prompt when server tools are present. */
 export function buildServerToolSystemPromptSuffix(
   serverTools: Record<string, unknown>[],
 ): string {
