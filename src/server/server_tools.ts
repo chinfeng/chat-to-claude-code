@@ -85,7 +85,7 @@ export async function executeWebSearch(
       try { data = JSON.parse(resBody); } catch { onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "searxng", requestUrl: url, requestHeaders: headers, status: res.status, responseHeaders: resHeaders, responseBody: truncate(resBody), error: "Invalid JSON response", resultCount: 0, durationMs: Date.now() - startMs }); return []; }
       const raw = data["results"];
       if (!Array.isArray(raw)) {
-        onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "searxng", requestUrl: url, requestHeaders: headers, status: res.status, responseHeaders: resHeaders, responseBody: truncate(resBody), resultCount: 0, durationMs: Date.now() - startMs, error: "Response 'results' field is not an array" });
+        onLog?.({ tool: "web_search", timestamp: new Date().toISOString(), input: query, engine: "searxng", requestUrl: url, requestHeaders: headers, status: res.status, responseHeaders: resHeaders, responseBody: truncate(resBody), resultCount: 0, durationMs: Date.now() - startMs, error: "Response results field is not an array" });
         return [];
       }
       results = raw;
@@ -314,18 +314,21 @@ export interface DetectedTextToolCall {
   input: Record<string, unknown>;
 }
 
-/** Detect web_search or web_fetch tool calls in upstream text output.
- *  Supports three patterns:
- *  1. `<tool_use>{"name": "web_search", "input": {"query": "..."}}</tool_use>`  (Claude-style XML tags)
- *  2. `WebSearch {"query": "..."}` / `WebFetch {"url": "..."}`                (natural language)
- *  Returns an array (may be empty if no tool calls found).
+/**
+ * Detect web_search or web_fetch tool calls in upstream text output.
+ * Supports four patterns:
+ * 1. Claude-style: tool_use tags wrapping JSON with name/input
+ * 2. WebSearch/WebFetch with JSON object
+ * 3. GLM-style XML: tool_call wrapper with tool_name and parameter sub-tags
+ * 4. Heuristic: tool_name and parameter tags without tool_call wrapper
+ * Returns an array (may be empty if no tool calls found).
  */
 export function detectServerToolInText(
   text: string,
 ): DetectedTextToolCall[] {
   const results: DetectedTextToolCall[] = [];
 
-  // Pattern 1: <tool_use>{"name": "web_search", "input": {...}}</tool_use>
+  // Pattern 1: Claude-style tool_use tags wrapping JSON
   const toolUseRe = /<tool_use>\s*(\{[\s\S]*?\})\s*<\/tool_use>/g;
   let match: RegExpExecArray | null;
   while ((match = toolUseRe.exec(text)) !== null) {
@@ -337,6 +340,31 @@ export function detectServerToolInText(
         results.push({ type: "web_fetch", input: parsed.input as Record<string, unknown> });
       }
     } catch {}
+  }
+
+  // Pattern 3 & 4: GLM-style XML tags with tool_name and parameter sub-tags
+  // GLM-5.1 emits either wrapped or unwrapped formats.
+  // Combined regex handles both by making the tool_call wrapper optional.
+  const glmToolCallRe = /(?:<tool_call>\s*)?<tool_name>\s*(web_search|web_fetch)\s*<\/tool_name>\s*((?:<parameter\s+name\s*=\s*"([^"]+)"\s*>([\s\S]*?)<\/parameter>\s*)+)(?:<\/tool_call>)?/gi;
+  let glmMatch: RegExpExecArray | null;
+  while ((glmMatch = glmToolCallRe.exec(text)) !== null) {
+    const toolName = glmMatch[1].toLowerCase();
+    const paramsBlock = glmMatch[2];
+    const input: Record<string, unknown> = {};
+
+    // Parse all parameter tags from the params block
+    const paramRe = /<parameter\s+name\s*=\s*"([^"]+)"\s*>([\s\S]*?)<\/parameter>/gi;
+    let paramMatch: RegExpExecArray | null;
+    while ((paramMatch = paramRe.exec(paramsBlock)) !== null) {
+      input[paramMatch[1]] = paramMatch[2].trim();
+    }
+
+    const toolType = toolName as "web_search" | "web_fetch";
+    if (toolType === "web_search" && input.query && !results.some((r) => r.type === "web_search" && r.input.query === input.query)) {
+      results.push({ type: "web_search", input });
+    } else if (toolType === "web_fetch" && input.url && !results.some((r) => r.type === "web_fetch" && r.input.url === input.url)) {
+      results.push({ type: "web_fetch", input });
+    }
   }
 
   // Pattern 2: WebSearch {"query": "..."} or WebFetch {"url": "..."}
@@ -364,17 +392,35 @@ export function detectServerToolInText(
 
   return results;
 }
-
-/** Strip <tool_use>...</tool_use> blocks and any hallucinated text after them from model output.
- *  When a model emits a tool_use in text but then continues with fake "results",
- *  we need to remove both the tag and the hallucinated continuation.
- *  Returns the clean text that precedes the first tool_use tag.
+/** Strip tool_use blocks and GLM-style tool_call tags,
+ * plus any hallucinated text after them, from model output.
+ * When a model emits a tool call in text but then continues
+ * with fake "results", we need to remove both the tag
+ * and the hallucinated continuation.
+ * Returns the clean text that precedes the first tool call tag.
  */
 export function stripToolUseFromText(text: string): string {
-  const idx = text.indexOf("<tool_use>");
-  if (idx === -1) return text;
-  // Keep text before the tool_use tag, strip trailing whitespace
-  return text.slice(0, idx).replace(/\s+$/, "");
+  // Check for Claude-style tool_use tags
+  const toolUseIdx = text.indexOf("<tool_use>");
+  if (toolUseIdx !== -1) {
+    return text.slice(0, toolUseIdx).replace(/\s+$/, "");
+  }
+
+  // Check for GLM-style tool_call tags
+  const toolCallTag = "<" + "tool_call>";
+  const toolCallIdx = text.indexOf(toolCallTag);
+  if (toolCallIdx !== -1) {
+    return text.slice(0, toolCallIdx).replace(/\s+$/, "");
+  }
+
+  // Check for unwrapped tool_name tags (tool_name containing web_search or web_fetch)
+  const toolNameRe = /<tool_name>\s*(?:web_search|web_fetch)\s*<\/tool_name>/;
+  const toolNameMatch = toolNameRe.exec(text);
+  if (toolNameMatch) {
+    return text.slice(0, toolNameMatch.index).replace(/\s+$/, "");
+  }
+
+  return text;
 }
 
 /** Check if a tool type string is an Anthropic server tool type. */

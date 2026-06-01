@@ -526,7 +526,26 @@ export function buildBaseRequestBody(
 
   const system = requestData.system;
   const serverTools = requestData.server_tools;
-  const serverToolPrompt = serverTools?.length ? buildServerToolSystemPromptSuffix(serverTools) : "";
+  // Collect server tools from BOTH server_tools field AND tools array
+  // (Claude Code puts server tools in tools array, not in server_tools field)
+  const allServerTools: Record<string, unknown>[] = [];
+  if (serverTools?.length) {
+    for (const st of serverTools) {
+      if (!allServerTools.some((t) => t.type === st.type && t.name === st.name)) {
+        allServerTools.push(st);
+      }
+    }
+  }
+  if (requestData.tools?.length) {
+    for (const tool of requestData.tools) {
+      if (isServerToolType(String(tool.type ?? ""))) {
+        if (!allServerTools.some((t) => t.type === tool.type && t.name === tool.name)) {
+          allServerTools.push(tool);
+        }
+      }
+    }
+  }
+  const serverToolPrompt = allServerTools.length ? buildServerToolSystemPromptSuffix(allServerTools) : "";
 
   if (system) {
     const systemMsg = AnthropicToOpenAIConverter.convertSystemPrompt(system);
@@ -555,12 +574,37 @@ export function buildBaseRequestBody(
   if (stopSequences && stopSequences.length) body.stop = stopSequences;
 
   const tools = requestData.tools;
-  // Build server tool function schemas
+  // Build server tool function schemas from BOTH server_tools field AND
+  // server tool entries embedded in the tools array (e.g. type="web_search_20250305").
+  // Claude Code sends server tools in the tools array, not in server_tools.
   const serverToolSchemas: Record<string, unknown>[] = [];
+  const seenServerToolTypes = new Set<string>();
+
+  // From server_tools field
   if (serverTools?.length) {
     for (const st of serverTools) {
-      const schema = buildServerToolFunctionSchema(String(st.type ?? ""), String(st.name ?? ""));
-      if (schema) serverToolSchemas.push(schema);
+      const stType = String(st.type ?? "");
+      const stName = String(st.name ?? "");
+      const schema = buildServerToolFunctionSchema(stType, stName);
+      if (schema) {
+        serverToolSchemas.push(schema);
+        seenServerToolTypes.add(stType);
+      }
+    }
+  }
+
+  // From tools array — extract server tool entries that were filtered by convertTools
+  if (tools?.length) {
+    for (const tool of tools) {
+      const toolType = String(tool.type ?? "");
+      if (isServerToolType(toolType) && !seenServerToolTypes.has(toolType)) {
+        const toolName = String(tool.name ?? "");
+        const schema = buildServerToolFunctionSchema(toolType, toolName);
+        if (schema) {
+          serverToolSchemas.push(schema);
+          seenServerToolTypes.add(toolType);
+        }
+      }
     }
   }
 
