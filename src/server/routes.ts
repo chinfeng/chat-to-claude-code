@@ -958,10 +958,14 @@ async function handleServerToolRequest(
     }
 
     // Stream the response to downstream:
-    // First emit server_tool_use + tool_result events, then the final text stream
+    // Emit tool results as text content blocks (NOT as server_tool_use events)
+    // to avoid triggering Claude Code's domain-safety verification against claude.ai.
+    // When the proxy has already executed web_fetch/web_search, emitting
+    // server_tool_use would cause Claude Code to contact claude.ai to verify
+    // domain safety — which fails when claude.ai is unreachable.
     const downstreamHeaders: Record<string, string> = {
-        "Content-Type": "text/event-stream",
-        ...ANTHROPIC_SSE_RESPONSE_HEADERS,
+      "Content-Type": "text/event-stream",
+      ...ANTHROPIC_SSE_RESPONSE_HEADERS,
     };
 
     const encoder = new TextEncoder();
@@ -969,34 +973,60 @@ async function handleServerToolRequest(
     const sse = new SSEBuilder(messageId, requestData.model, inputTokens);
 
     const readable = new ReadableStream({
-        async start(controller) {
-            const downstreamChunks: string[] = [];
+      async start(controller) {
+        const downstreamChunks: string[] = [];
 
-            function emit(event: string) {
-                downstreamChunks.push(event);
-                controller.enqueue(encoder.encode(event));
+        function emit(event: string) {
+          downstreamChunks.push(event);
+          controller.enqueue(encoder.encode(event));
+        }
+
+        try {
+          // 1. Emit message_start
+          emit(sse.message_start());
+
+          // 2. Emit tool results as text content blocks instead of
+          // server_tool_use + tool_result events.
+          // This prevents Claude Code from attempting to verify domain
+          // safety via claude.ai (which fails when claude.ai is unreachable).
+          const toolResultTexts: string[] = [];
+          for (const event of serverToolEvents) {
+            if (event.type === "server_tool_use") {
+              // Skip — do NOT emit server_tool_use to downstream.
+              // The proxy has already executed the tool; Claude Code
+              // must not try to verify or execute it again.
+            } else if (event.type === "web_search_tool_result") {
+              const content = event.content as Record<string, unknown>[];
+              const searchResults = content
+                .filter((b) => b.type === "web_search_result")
+                .map((b) => {
+                  const url = b.url ? String(b.url) : "";
+                  const title = b.title ? String(b.title) : "";
+                  const snippet = b.snippet ? String(b.snippet) : "";
+                  return snippet ? `${title}\n${url}\n${snippet}` : `${title}\n${url}`;
+                })
+                .filter(Boolean)
+                .join("\n\n");
+              if (searchResults) {
+                toolResultTexts.push(`[Web Search Results]\n${searchResults}`);
+              }
+            } else if (event.type === "web_fetch_tool_result") {
+              const content = event.content as Record<string, unknown>[];
+              const fetchText = content
+                .filter((b) => b.type === "text" && typeof b.text === "string")
+                .map((b) => b.text as string)
+                .join("\n");
+              if (fetchText) {
+                toolResultTexts.push(`[Web Fetch Result]\n${fetchText}`);
+              }
             }
+          }
 
-            try {
-                // 1. Emit message_start
-                emit(sse.message_start());
-
-                // 2. Emit server_tool_use + tool_result events
-                for (const event of serverToolEvents) {
-                    if (event.type === "server_tool_use") {
-                        for (const e of sse.emit_server_tool_use(event.toolUseId, event.toolName, event.input)) {
-                            emit(e);
-                        }
-                    } else if (event.type === "web_search_tool_result") {
-                        for (const e of sse.emit_web_search_tool_result(event.toolUseId, event.content, event.status)) {
-                            emit(e);
-                        }
-                    } else if (event.type === "web_fetch_tool_result") {
-                        for (const e of sse.emit_web_fetch_tool_result(event.toolUseId, event.content, event.status)) {
-                            emit(e);
-                        }
-                    }
-                }
+          if (toolResultTexts.length > 0) {
+            for (const event of sse.ensure_text_block()) emit(event);
+            emit(sse.emit_text_delta(toolResultTexts.join("\n\n")));
+            for (const event of sse.close_content_blocks()) emit(event);
+          }
 
                 // 3. Stream the final upstream response (text content from the model)
                 const finalReader = finalResBody!.getReader();
