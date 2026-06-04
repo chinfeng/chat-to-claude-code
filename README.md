@@ -162,7 +162,7 @@ bun run src/server/index.ts \
   --upstream-api-key sk-xxx \
   --enable-web-search \
   --web-search-engine searxng \
-  --web-search-base-url https://sea.mayeve.cn
+  --web-search-base-url https://searxng.example.com
 ```
 
 No `--web-search-api-key` is required for SearXNG unless your instance requires authentication.
@@ -175,7 +175,7 @@ bun run src/server/index.ts \
   --upstream-api-key sk-xxx \
   --enable-web-search \
   --web-search-engine searxng \
-  --web-search-base-url https://sea.mayeve.cn \
+  --web-search-base-url https://searxng.example.com \
   --enable-web-fetch \
   --web-fetch-allowed-domain docs.example.com \
   --web-fetch-allowed-domain api.example.com

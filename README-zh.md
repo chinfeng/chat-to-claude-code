@@ -2,6 +2,8 @@
 
 将任意 OpenAI Chat Completions 兼容端点转为 Anthropic Messages API，让 Claude Code CLI 直接使用。
 
+[English](README.md)
+
 ## 设计哲学
 
 本项目遵循 Unix 哲学：**一个进程只对接一个上游端点**。若需同时使用多个上游（如不同模型或 provider），请启动多个进程，各自监听不同端口，由客户端或负载均衡器做路由选择。这样做的好处是：
@@ -16,7 +18,7 @@
 
 - **更小占用** — 纯 Bun 运行时，零 npm 依赖，磁盘和内存占用远低于 Python + FastAPI 方案
 - **简化路由** — 完全去掉多上游转发，仅保留单上游的 OpenAI→Anthropic 协议中转
-- **透传友好** — 支持 auth_token 透传，无需硬编码上游密钥，适合部署在极轻量服务器（如 1C1G）上
+- **透传友好** — 支持 auth token 透传，无需硬编码上游密钥，适合部署在极轻量服务器（如 1C1G）上
 - **多进程扩展** — 需要多个上游时，只需每个上游启动一个进程，监听不同端口，由反向代理或 DNS 做路由分发
 
 ### 多上游部署示例
@@ -68,7 +70,7 @@ Claude Code CLI 收到标准 Anthropic 响应
 - **工具调用** — 原生 `tool_calls` 和文本形式的 `● <function=...>` 启发式解析均支持
 - **下游鉴权** — 可选 `--auth-token` 对接入方进行 x-api-key 验证
 - **请求转储** — 可选 `--dump <dir>` 记录完整请求/响应，便于调试
-- **零依赖** — 纯 Bun runtime，无外部 npm 包
+- **零依赖** — 纯 Bun 运行时，无外部 npm 包
 
 ## 快速开始
 
@@ -105,6 +107,9 @@ chat-to-claude-code listening on http://localhost:8082
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:8082"
 export ANTHROPIC_AUTH_TOKEN="your-token-here"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="deepseek-ai/deepseek-v4-pro"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="qwen/qwen3.5-397b-a17b"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="minimaxai/minimax-m2.7"
 claude
 ```
 
@@ -135,6 +140,54 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--web-fetch-blocked-domain` | — | Web 抓取屏蔽的域名（可重复指定） |
 | `--web-fetch-max-content-tokens` | `5000` | Web 抓取结果的最大内容 token 数 |
 
+### Server Tools（Web 搜索 & Web 抓取）
+
+本代理可代替不支持原生 server tools 的上游模型执行 Anthropic 风格的 `web_search` 和 `web_fetch`。当模型在文本输出中发出匹配 `WebSearch` / `WebFetch` 的工具调用时，代理会拦截、执行，并将结果以 Anthropic `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` 内容块返回。
+
+#### Brave Search（默认）
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-api-key BST-xxxx
+```
+
+#### SearXNG（自建实例）
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-engine searxng \
+  --web-search-base-url https://searxng.example.com
+```
+
+SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
+
+#### 同时启用搜索和抓取
+
+```bash
+bun run src/server/index.ts \
+  --upstream-base-url https://api.openai.com/v1 \
+  --upstream-api-key sk-xxx \
+  --enable-web-search \
+  --web-search-engine searxng \
+  --web-search-base-url https://searxng.example.com \
+  --enable-web-fetch \
+  --web-fetch-allowed-domain docs.example.com \
+  --web-fetch-allowed-domain api.example.com
+```
+
+**工作流程：**
+
+1. 客户端发送带有 `server_tools: [{type: "web_search_20250305"}, {type: "web_fetch_20250305"}]` 的请求
+2. 代理检测到 server tools 类型，转发到上游前将其移除
+3. 如果上游模型以启发式文本工具调用的形式调用 `WebSearch` / `WebFetch`，代理会拦截
+4. 代理执行调用（Brave Search API 或 SearXNG 执行搜索，直接 HTTP 执行抓取），并将结果以 Anthropic SSE 事件返回给客户端
+
 ### 按模型注入额外参数
 
 使用 `--upstream-extra-params` 根据请求中的模型名向上游请求体注入额外的 JSON 字段。格式为 `glob=JSON`：
@@ -158,54 +211,6 @@ bun run src/server/index.ts \
 
 当请求携带 `model: "claude-sonnet-4-20250514"` 到达时，匹配到 `claude-sonnet-*` 模式，其 JSON 会被合并到上游请求体中。`*` 通配符可作为所有未匹配模型的默认规则。
 
-### Server Tools（Web 搜索 & Web 抓取）
-
-本代理可代替不支持原生 server tools 的上游模型执行 Anthropic 风格的 `web_search` 和 `web_fetch`。当模型在文本输出中发出匹配 `WebSearch` / `WebFetch` 的工具调用时，代理会拦截、执行，并将结果以 Anthropic `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` 内容块返回。
-
-#### Brave Search（默认）
-
-```bash
-bun run src/server/index.ts \
-  --upstream-base-url https://api.openai.com/v1 \
-  --upstream-api-key sk-xxx \
-  --enable-web-search \
-  --web-search-api-key BST-xxxx
-```
-
-#### SearXNG（自建实例）
-
-```bash
-bun run src/server/index.ts \
-  --upstream-base-url https://api.openai.com/v1 \
-  --upstream-api-key sk-xxx \
-  --enable-web-search \
-  --web-search-engine searxng \
-  --web-search-base-url https://sea.mayeve.cn
-```
-
-SearXNG 无需 `--web-search-api-key`，除非你的实例要求认证。
-
-#### 同时启用搜索和抓取
-
-```bash
-bun run src/server/index.ts \
-  --upstream-base-url https://api.openai.com/v1 \
-  --upstream-api-key sk-xxx \
-  --enable-web-search \
-  --web-search-engine searxng \
-  --web-search-base-url https://sea.mayeve.cn \
-  --enable-web-fetch \
-  --web-fetch-allowed-domain docs.example.com \
-  --web-fetch-allowed-domain api.example.com
-```
-
-**工作流程：**
-
-1. 客户端发送带有 `server_tools: [{type: "web_search_20250305"}, {type: "web_fetch_20250305"}]` 的请求
-2. 代理检测到 server tools 类型，转发到上游前将其移除
-3. 如果上游模型以启发式文本工具调用的形式调用 `WebSearch` / `WebFetch`，代理会拦截
-4. 代理执行调用（Brave Search API 或 SearXNG 执行搜索，直接 HTTP 执行抓取），并将结果以 Anthropic SSE 事件返回给客户端
-
 ### 透传模式
 
 当 `--upstream-api-key` 与 `--auth-token` 均未配置时，自动启用透传模式：客户端通过 `x-api-key` 或 `Authorization` 头部传入的 Key 将原样转发给上游端点。
@@ -216,7 +221,7 @@ bun run src/server/index.ts \
 
 ### 请求转储
 
-启用 `--dump <dir>` 后，每个下游请求会创建一个顺序编号的目录，内含 `request.log` 和 `response.log`。请求完成后，目录会重命名为 `{序号}-{开始时间}-{结束时间}` 格式，便于按时间排序和查找。流式响应的完整 SSE 事件也会被记录。
+启用 `--dump <dir>` 后，每个下游请求会创建一个顺序编号的目录，内含 `downstream-request.log`、`downstream-response.log`、`upstream-request.log` 和 `upstream-response.log`。完成后，目录会重命名为 `{序号}-{开始时间}-{结束时间}` 格式，便于按时间排序和查找。完整的 SSE 事件流也会被记录。
 
 ```bash
 bun run src/server/index.ts \
@@ -230,8 +235,10 @@ bun run src/server/index.ts \
 ```
 /var/log/chat-to-claude-code/
 └── 1-2026-05-20T08-30-00-000Z-2026-05-20T08-30-05-123Z/
-    ├── request.log
-    └── response.log
+    ├── downstream-request.log
+    ├── downstream-response.log
+    ├── upstream-request.log
+    └── upstream-response.log
 ```
 
 ## 打包为单文件可执行
@@ -298,10 +305,10 @@ docker run -p 8082:8082 chat-to-claude-code \
 
 | Anthropic | OpenAI | 说明 |
 |-----------|--------|------|
-| `system` (string / content blocks) | `{"role": "system", "content": "..."}` | 系统提示提取为 system message |
+| `system`（字符串 / content blocks） | `{"role": "system", "content": "..."}` | 系统提示提取为 system 消息 |
 | `tool_use` block | `tool_calls[i]` | 工具调用参数 JSON 序列化 |
-| `tool_result` block | `{"role": "tool", "tool_call_id": "..."}` | 工具结果序列化为 tool message |
-| `thinking` block | thinking tag 嵌入 content | 由 `ReasoningReplayMode` 控制 |
+| `tool_result` block | `{"role": "tool", "tool_call_id": "..."}` | 工具结果序列化为 tool 消息 |
+| `thinking` block | thinking tag 嵌入 content 中 | 由 `ReasoningReplayMode` 控制 |
 | `redacted_thinking` block | 丢弃 | 不转发至上游 |
 
 ### 流式 SSE 事件映射
@@ -309,9 +316,10 @@ docker run -p 8082:8082 chat-to-claude-code \
 | OpenAI chunk | Anthropic SSE event |
 |-------------|-------------------|
 | `delta.reasoning_content` | `content_block_start(thinking)` + `content_block_delta(thinking_delta)` |
-| `delta.content` (含 thinking tag) | 解析后分发为 thinking / text delta |
-| `delta.content` (纯文本) | `content_block_delta(text_delta)` |
+| `delta.content`（含 thinking tag） | 解析后分发为 thinking / text delta |
+| `delta.content`（纯文本） | `content_block_delta(text_delta)` |
 | `delta.tool_calls` | `content_block_start(tool_use)` + `content_block_delta(input_json_delta)` |
+| `delta.content`（WebSearch/WebFetch 文本） | `content_block_start(server_tool_use)` + `content_block_start(web_search_tool_result)` |
 | `finish_reason: "stop"` | `message_delta(stop_reason: "end_turn")` |
 | `finish_reason: "tool_calls"` | `message_delta(stop_reason: "tool_use")` |
 
@@ -393,12 +401,13 @@ src/
 │   ├── errors.ts          # Anthropic 格式错误响应
 │   └── tokens.ts          # Token 估算（char/4 启发式）
 ├── parsers/
-│   ├── think_tag_parser.ts       # think tag streaming parser
+│   ├── think_tag_parser.ts       # Think tag 流式解析器
 │   └── heuristic_tool_parser.ts  # ● <function=...> 启发式工具调用解析
 ├── server/
 │   ├── config.ts          # CLI 参数配置加载
 │   ├── index.ts           # Bun.serve() 入口 + CORS
-│   └── routes.ts          # HTTP 路由处理 + 鉴权
+│   ├── routes.ts          # HTTP 路由处理 + 鉴权
+│   └── server_tools.ts    # 代理端 web_search / web_fetch 执行
 ├── sse/
 │   └── builder.ts         # Anthropic SSE 事件构建器
 ├── transport/
@@ -429,7 +438,7 @@ bunx tsc --noEmit
 bun run build
 ```
 
-## 与 free-claude-code (Python) 的差异
+## 与 free-claude-code（Python 版）的差异
 
 本项目是 [free-claude-code](https://github.com/chinfeng/free-claude-code) 的 TypeScript/Bun 精简移植，聚焦核心协议转换功能：
 
@@ -437,7 +446,7 @@ bun run build
 |------|-----------|----------------|
 | 运行时 | Python 3.14 + FastAPI | Bun |
 | 外部依赖 | FastAPI, Pydantic, httpx, tiktoken 等 | 零 |
-| Provider 数量 | 11 (NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI) | 1（通用 OpenAI 兼容端点） |
+| Provider 数量 | 11（NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI） | 1（通用 OpenAI 兼容端点） |
 | Model Router | Opus/Sonnet/Haiku 多 provider 路由 | 无（单一 upstream） |
 | 配置方式 | 环境变量 | CLI 启动参数 |
 | 下游鉴权 | 无 | AUTH_TOKEN 验证 |
