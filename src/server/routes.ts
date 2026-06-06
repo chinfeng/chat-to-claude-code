@@ -350,7 +350,7 @@ function extractServerToolsFromRequest(requestData: RequestData): Record<string,
 /** Build just the upstream request body (without creating a Request object). */
 function buildUpstreamRequestBodyOnly(
   requestData: RequestData,
-  selectedUpstream: SelectedUpstream,
+  apiKey: string,
   upstreamBaseUrl: string,
   modelOverrides: ModelOverride[],
 ): { requestBody: string; requestHeaders: Record<string, string> } {
