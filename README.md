@@ -6,7 +6,7 @@ Convert any OpenAI Chat Completions compatible endpoint to the Anthropic Message
 
 ## Design Philosophy
 
-This project follows the Unix philosophy: **one process, one upstream endpoint**. If you need multiple upstreams (e.g. different models or providers), run multiple processes on different ports and let the client or a load balancer handle routing. Benefits:
+This project follows the Unix philosophy: **one process, one upstream endpoint** (or use route mode for multi-upstream within a single process). If you need multiple upstreams (e.g. different models or providers), you can either use route mode or run multiple processes on different ports and let the client or a load balancer handle routing. Benefits:
 
 - Each process is simple, predictable, and easy to debug
 - No built-in routing state — processes are stateless, start and stop at will
@@ -17,7 +17,7 @@ This project follows the Unix philosophy: **one process, one upstream endpoint**
 Inspired by [free-claude-code](https://github.com/Alishahryar1/free-claude-code), this project was created to provide a **lighter-weight alternative** for deployment:
 
 - **Smaller footprint** — Pure Bun runtime with zero npm dependencies, consuming less disk space and memory than a Python + FastAPI stack
-- **Simplified routing** — Multi-upstream forwarding is removed entirely; only single-upstream OpenAI-to-Anthropic protocol translation remains
+- **Simplified routing** — Single-upstream by default; use route mode (`--route-config`) for built-in multi-upstream routing, or run multiple processes for manual routing
 - **Passthrough-friendly** — Auth token passthrough allows deploying on minimal servers (e.g. 1 vCPU / 1 GB RAM) without hardcoding upstream keys
 - **Multi-process scaling** — When multiple upstreams are needed, simply run one process per upstream on different ports, and let a reverse proxy or DNS route traffic
 
@@ -130,6 +130,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--enable-thinking` | `true` | Convert upstream reasoning content to Anthropic thinking blocks |
 | `--no-enable-thinking` | — | Disable thinking conversion |
 | `--upstream-extra-params` | — | Model-specific extra parameters for upstream requests (repeatable); see below |
+| `--route-config` | — | Path to JSON route configuration file; activates route mode (mutually exclusive with `--upstream-base-url`/`--upstream-api-key`) |
 | `--dump` | `""` | Request dump directory; when set, each request is written to a unique subdirectory |
 | `--enable-web-search` | `false` | Enable proxy-side web search |
 | `--web-search-engine` | `brave` | Search engine type: `brave` (Brave Search API) or `searxng` (SearXNG) |
@@ -210,6 +211,99 @@ bun run src/server/index.ts \
 ```
 
 When a request arrives with `model: "claude-sonnet-4-20250514"`, the matching `claude-sonnet-*` pattern is selected and its JSON is merged into the upstream request body. The catch-all `*` pattern acts as a default for any unmatched model.
+
+### Route Mode (Multi-Upstream)
+
+Use `--route-config <path>` to activate route mode with a JSON configuration file. This enables multiple upstream endpoints with a configurable routing algorithm.
+
+When `--route-config` is set, `--upstream-base-url` and `--upstream-api-key` are not allowed (mutually exclusive).
+
+#### Configuration File
+
+```json
+{
+  "port": 8082,
+  "authToken": "my-secret",
+  "enableThinking": true,
+  "dumpDir": "",
+  "algorithm": "round-robin",
+  "upstreams": [
+    {
+      "name": "nim",
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "apiKey": "nvapi-xxxx",
+      "weight": 1,
+      "tokenBudget": 100000,
+      "aliases": {
+        "claude-sonnet-4": "deepseek-v4-pro",
+        "claude-opus-4": "deepseek-v4-pro"
+      },
+      "modelOverrides": [
+        {
+          "pattern": "deepseek*",
+          "extra": {
+            "reasoning_effort": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "openrouter",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKey": "sk-or-xxxx",
+      "weight": 2,
+      "tokenBudget": 50000,
+      "aliases": {},
+      "modelOverrides": []
+    }
+  ],
+  "serverTools": {
+    "webSearch": false,
+    "webFetch": false
+  }
+}
+```
+
+#### Routing Algorithms
+
+| Algorithm | Description |
+|-----------|-------------|
+| `round-robin` | Cycles through upstreams in order (default) |
+| `token-budget` | Selects the upstream with the highest remaining token budget |
+| `weighted` | Weighted round-robin; distributes requests by weight ratio |
+
+**Token Budget:** Each upstream can set `tokenBudget` (default: 0 = unlimited). After each request completes, the response's `usage.completion_tokens` is deducted from the upstream's remaining budget. When all upstreams are depleted, falls back to round-robin.
+
+**Weighted:** Uses smooth Weighted Round Robin. With weights `[1, 2]`, the request pattern is `b → a → b` (1:2 ratio).
+
+**Route Logging:** Each request logs the routing decision:
+
+```
+[route] algorithm=round-robin selected=nim | nim:5 openrouter:3
+[route] algorithm=token-budget selected=openrouter | nim:45000/100000 openrouter:48000/50000
+[route] algorithm=weighted selected=openrouter | nim:2/1 openrouter:4/2
+```
+
+#### Model Aliases
+
+Each upstream can define `aliases` — a mapping from the model name in the request to the actual model name sent upstream. This lets clients use familiar model names (e.g. `claude-sonnet-4`) while the proxy sends the upstream-specific model name (e.g. `deepseek-v4-pro`).
+
+```json
+{
+  "name": "nim",
+  "aliases": {
+    "claude-sonnet-4": "deepseek-v4-pro"
+  }
+}
+```
+
+When a request with `model: "claude-sonnet-4"` is routed to the `nim` upstream, the proxy sends `model: "deepseek-v4-pro"` to the upstream. The downstream response retains the original model name.
+
+#### Route Mode Notes
+
+- **No passthrough:** Every upstream must have `apiKey` configured. There is no passthrough mode in route mode.
+- **Downstream auth:** `authToken` is global (not per-upstream). When set, all clients must provide a matching key.
+- **Per-upstream model overrides:** Each upstream can have its own `modelOverrides` (same format as `--upstream-extra-params`).
 
 ### Passthrough Mode
 
@@ -447,7 +541,7 @@ This project is a streamlined TypeScript/Bun port of [free-claude-code](https://
 | Runtime | Python 3.14 + FastAPI | Bun |
 | External deps | FastAPI, Pydantic, httpx, tiktoken, etc. | Zero |
 | Provider count | 11 (NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI) | 1 (generic OpenAI-compatible endpoint) |
-| Model Router | Opus/Sonnet/Haiku multi-provider routing | None (single upstream) |
+| Model Router | Opus/Sonnet/Haiku multi-provider routing | Route mode (round-robin / token-budget / weighted) |
 | Configuration | Environment variables | CLI startup arguments |
 | Downstream auth | None | AUTH_TOKEN verification |
 | Executable | None | bun build --compile single file |

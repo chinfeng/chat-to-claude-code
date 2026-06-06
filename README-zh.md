@@ -6,7 +6,7 @@
 
 ## 设计哲学
 
-本项目遵循 Unix 哲学：**一个进程只对接一个上游端点**。若需同时使用多个上游（如不同模型或 provider），请启动多个进程，各自监听不同端口，由客户端或负载均衡器做路由选择。这样做的好处是：
+本项目遵循 Unix 哲学：**一个进程只对接一个上游端点**（或使用路由模式在单进程内支持多上游）。若需同时使用多个上游（如不同模型或 provider），可以使用路由模式，或启动多个进程，各自监听不同端口，由客户端或负载均衡器做路由选择。这样做的好处是：
 
 - 每个进程简单、可预测、易调试
 - 无内置路由状态，进程无状态，随起随停
@@ -17,7 +17,7 @@
 受 [free-claude-code](https://github.com/Alishahryar1/free-claude-code) 启发，本项目旨在提供一个**更轻量的部署方案**：
 
 - **更小占用** — 纯 Bun 运行时，零 npm 依赖，磁盘和内存占用远低于 Python + FastAPI 方案
-- **简化路由** — 完全去掉多上游转发，仅保留单上游的 OpenAI→Anthropic 协议中转
+- **简化路由** — 默认单上游；可使用路由模式（`--route-config`）实现内置多上游路由，也可通过多进程手动路由
 - **透传友好** — 支持 auth token 透传，无需硬编码上游密钥，适合部署在极轻量服务器（如 1C1G）上
 - **多进程扩展** — 需要多个上游时，只需每个上游启动一个进程，监听不同端口，由反向代理或 DNS 做路由分发
 
@@ -130,6 +130,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_AUTH_TOKEN=freecc claude
 | `--enable-thinking` | `true` | 将上游推理内容转为 Anthropic thinking block |
 | `--no-enable-thinking` | — | 禁用 thinking 转换 |
 | `--upstream-extra-params` | — | 按模型注入上游请求额外参数（可重复指定）；见下方说明 |
+| `--route-config` | — | JSON 路由配置文件路径；激活路由模式（与 `--upstream-base-url`/`--upstream-api-key` 互斥） |
 | `--dump` | `""` | 请求转储目录；启用后每个请求写入独立子目录 |
 | `--enable-web-search` | `false` | 启用代理端 Web 搜索 |
 | `--web-search-engine` | `brave` | 搜索引擎类型：`brave`（Brave Search API）或 `searxng`（SearXNG） |
@@ -210,6 +211,99 @@ bun run src/server/index.ts \
 ```
 
 当请求携带 `model: "claude-sonnet-4-20250514"` 到达时，匹配到 `claude-sonnet-*` 模式，其 JSON 会被合并到上游请求体中。`*` 通配符可作为所有未匹配模型的默认规则。
+
+### 路由模式（多上游）
+
+使用 `--route-config <path>` 通过 JSON 配置文件激活路由模式，支持多个上游端点及可配置的路由算法。
+
+当 `--route-config` 设置后，`--upstream-base-url` 和 `--upstream-api-key` 不可使用（互斥）。
+
+#### 配置文件
+
+```json
+{
+  "port": 8082,
+  "authToken": "my-secret",
+  "enableThinking": true,
+  "dumpDir": "",
+  "algorithm": "round-robin",
+  "upstreams": [
+    {
+      "name": "nim",
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "apiKey": "nvapi-xxxx",
+      "weight": 1,
+      "tokenBudget": 100000,
+      "aliases": {
+        "claude-sonnet-4": "deepseek-v4-pro",
+        "claude-opus-4": "deepseek-v4-pro"
+      },
+      "modelOverrides": [
+        {
+          "pattern": "deepseek*",
+          "extra": {
+            "reasoning_effort": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "openrouter",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKey": "sk-or-xxxx",
+      "weight": 2,
+      "tokenBudget": 50000,
+      "aliases": {},
+      "modelOverrides": []
+    }
+  ],
+  "serverTools": {
+    "webSearch": false,
+    "webFetch": false
+  }
+}
+```
+
+#### 路由算法
+
+| 算法 | 说明 |
+|------|------|
+| `round-robin` | 按顺序轮询上游（默认） |
+| `token-budget` | 选择剩余 Token 预算最高的上游 |
+| `weighted` | 按权重轮询；按权重比例分配请求 |
+
+**Token 预算：** 每个上游可设置 `tokenBudget`（默认：0 = 无限制）。每次请求完成后，响应中的 `usage.completion_tokens` 会从该上游的剩余预算中扣除。当所有上游预算耗尽时，回退到轮询。
+
+**按权重：** 使用平滑加权轮询。权重为 `[1, 2]` 时，请求模式为 `b → a → b`（1:2 比例）。
+
+**路由日志：** 每次请求都会输出路由决策：
+
+```
+[route] algorithm=round-robin selected=nim | nim:5 openrouter:3
+[route] algorithm=token-budget selected=openrouter | nim:45000/100000 openrouter:48000/50000
+[route] algorithm=weighted selected=openrouter | nim:2/1 openrouter:4/2
+```
+
+#### 模型别名
+
+每个上游可以定义 `aliases`——将请求中的模型名映射为发送到上游的实际模型名。这让客户端可以使用熟悉的模型名（如 `claude-sonnet-4`），而代理发送上游特定的模型名（如 `deepseek-v4-pro`）。
+
+```json
+{
+  "name": "nim",
+  "aliases": {
+    "claude-sonnet-4": "deepseek-v4-pro"
+  }
+}
+```
+
+当请求携带 `model: "claude-sonnet-4"` 被路由到 `nim` 上游时，代理会向上游发送 `model: "deepseek-v4-pro"`。下游响应保留原始模型名。
+
+#### 路由模式注意事项
+
+- **无透传模式：** 每个上游必须配置 `apiKey`，路由模式下不存在透传模式。
+- **下游鉴权：** `authToken` 是全局的（非逐上游配置）。设置后所有客户端必须提供匹配的密钥。
+- **逐上游模型覆盖：** 每个上游可以有独立的 `modelOverrides`（格式与 `--upstream-extra-params` 相同）。
 
 ### 透传模式
 
@@ -447,7 +541,7 @@ bun run build
 | 运行时 | Python 3.14 + FastAPI | Bun |
 | 外部依赖 | FastAPI, Pydantic, httpx, tiktoken 等 | 零 |
 | Provider 数量 | 11（NIM, OpenRouter, DeepSeek, Kimi, Wafer, LM Studio, llama.cpp, Ollama, OpenCode, Z.ai, OpenAI） | 1（通用 OpenAI 兼容端点） |
-| Model Router | Opus/Sonnet/Haiku 多 provider 路由 | 无（单一 upstream） |
+| Model Router | Opus/Sonnet/Haiku 多 provider 路由 | 路由模式（轮询 / Token 预算 / 按权重） |
 | 配置方式 | 环境变量 | CLI 启动参数 |
 | 下游鉴权 | 无 | AUTH_TOKEN 验证 |
 | 可执行文件 | 无 | bun build --compile 单文件 |
