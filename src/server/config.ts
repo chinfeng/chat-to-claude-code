@@ -1,5 +1,7 @@
 /** CLI-argument-based server configuration. */
 
+import { loadRouteConfig, type NormalizedRouteConfig, type UpstreamConfig, type RouteAlgorithm } from "./route_config.js";
+
 export interface ModelOverride {
   pattern: string;
   extra: Record<string, unknown>;
@@ -27,6 +29,24 @@ export interface ServerConfig {
   dumpDir: string;
   modelOverrides: ModelOverride[];
   serverTools: ServerToolConfig;
+}
+
+export interface ResolvedConfig {
+  mode: "single" | "route";
+  authToken: string;
+  port: number;
+  enableThinking: boolean;
+  dumpDir: string;
+  serverTools: ServerToolConfig;
+  upstream?: {
+    baseUrl: string;
+    apiKey: string;
+    modelOverrides: ModelOverride[];
+  };
+  route?: {
+    algorithm: RouteAlgorithm;
+    upstreams: UpstreamConfig[];
+  };
 }
 
 /** Minimal glob matching: supports `*` (any segment chars) and `?` (single char). */
@@ -167,3 +187,56 @@ function parseArgs(): ServerConfig {
 }
 
 export const loadConfig = parseArgs;
+
+/** Resolve the full configuration: either single mode (CLI args) or route mode (JSON config). */
+export function resolveConfig(): ResolvedConfig {
+  const args = Bun.argv;
+  const getArg = (name: string, fallback: string): string => {
+    const flag = `--${name}`;
+    const idx = args.indexOf(flag);
+    if (idx !== -1 && idx + 1 < args.length) return args[idx + 1];
+    const eqFlag = `${flag}=`;
+    const eqArg = args.find((a) => a.startsWith(eqFlag));
+    if (eqArg) return eqArg.slice(eqFlag.length);
+    return fallback;
+  };
+
+  const routeConfigPath = getArg("route-config", "");
+  if (routeConfigPath) {
+    // Route mode — check mutual exclusivity with single-upstream CLI args
+    const hasUpstreamKey = getArg("upstream-api-key", "") !== "";
+    const hasUpstreamUrl = getArg("upstream-base-url", "https://api.openai.com/v1") !== "https://api.openai.com/v1";
+    if (hasUpstreamKey || hasUpstreamUrl) {
+      throw new Error("--route-config is mutually exclusive with --upstream-base-url and --upstream-api-key");
+    }
+    const routeConfig = loadRouteConfig(routeConfigPath);
+    return {
+      mode: "route",
+      authToken: routeConfig.authToken,
+      port: routeConfig.port,
+      enableThinking: routeConfig.enableThinking,
+      dumpDir: routeConfig.dumpDir,
+      serverTools: routeConfig.serverTools,
+      route: {
+        algorithm: routeConfig.algorithm,
+        upstreams: routeConfig.upstreams,
+      },
+    };
+  }
+
+  // Single mode — use existing CLI arg parsing
+  const singleConfig = parseArgs();
+  return {
+    mode: "single",
+    authToken: singleConfig.authToken,
+    port: singleConfig.port,
+    enableThinking: singleConfig.enableThinking,
+    dumpDir: singleConfig.dumpDir,
+    serverTools: singleConfig.serverTools,
+    upstream: {
+      baseUrl: singleConfig.upstreamBaseUrl,
+      apiKey: singleConfig.upstreamApiKey,
+      modelOverrides: singleConfig.modelOverrides,
+    },
+  };
+}

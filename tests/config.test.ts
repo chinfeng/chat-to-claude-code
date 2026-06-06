@@ -1,6 +1,6 @@
 import { describe, it, expect } from "bun:test";
-import { loadConfig, globMatch, resolveModelExtra, deepMerge } from "../src/server/config.js";
-import type { ModelOverride } from "../src/server/config.js";
+import { loadConfig, globMatch, resolveModelExtra, deepMerge, resolveConfig } from "../src/server/config.js";
+import type { ModelOverride, ResolvedConfig } from "../src/server/config.js";
 
 describe("globMatch", () => {
   it("matches exact strings", () => {
@@ -226,6 +226,67 @@ describe("loadConfig", () => {
     expect(warnings.length).toBe(3);
 
     console.warn = origWarn;
+    Bun.argv = origArgv;
+  });
+});
+
+describe("resolveConfig", () => {
+  it("resolves single mode when no --route-config", () => {
+    const origArgv = Bun.argv;
+    Bun.argv = ["bun", "run", "src/server/index.ts", "--upstream-api-key", "sk-test"];
+    const resolved = resolveConfig();
+    expect(resolved.mode).toBe("single");
+    expect(resolved.upstream?.apiKey).toBe("sk-test");
+    expect(resolved.route).toBeUndefined();
+    Bun.argv = origArgv;
+  });
+
+  it("resolves route mode when --route-config is provided", () => {
+    const tmpFile = `/tmp/test-route-resolve-${Date.now()}.json`;
+    const raw = {
+      algorithm: "round-robin",
+      upstreams: [{ name: "nim", baseUrl: "https://api.nvidia.com/v1", apiKey: "nvapi-xxx" }],
+    };
+    require("fs").writeFileSync(tmpFile, JSON.stringify(raw));
+
+    const origArgv = Bun.argv;
+    Bun.argv = ["bun", "run", "src/server/index.ts", "--route-config", tmpFile];
+    const resolved = resolveConfig();
+    expect(resolved.mode).toBe("route");
+    expect(resolved.route).toBeDefined();
+    expect(resolved.route!.algorithm).toBe("round-robin");
+    expect(resolved.route!.upstreams.length).toBe(1);
+    expect(resolved.route!.upstreams[0].name).toBe("nim");
+    expect(resolved.upstream).toBeUndefined();
+    Bun.argv = origArgv;
+    try { require("fs").unlinkSync(tmpFile); } catch {}
+  });
+
+  it("throws when both --route-config and --upstream-api-key are provided", () => {
+    const tmpFile = `/tmp/test-route-conflict-${Date.now()}.json`;
+    const raw = {
+      algorithm: "round-robin",
+      upstreams: [{ name: "nim", baseUrl: "https://api.nvidia.com/v1", apiKey: "nvapi-xxx" }],
+    };
+    require("fs").writeFileSync(tmpFile, JSON.stringify(raw));
+
+    const origArgv = Bun.argv;
+    Bun.argv = ["bun", "run", "src/server/index.ts", "--route-config", tmpFile, "--upstream-api-key", "sk-test"];
+    expect(() => resolveConfig()).toThrow();
+    Bun.argv = origArgv;
+    try { require("fs").unlinkSync(tmpFile); } catch {}
+  });
+
+  it("single mode config has all fields from original ServerConfig", () => {
+    const origArgv = Bun.argv;
+    Bun.argv = ["bun", "run", "src/server/index.ts", "--upstream-api-key", "sk-test", "--port", "9090"];
+    const resolved = resolveConfig();
+    expect(resolved.mode).toBe("single");
+    expect(resolved.port).toBe(9090);
+    expect(resolved.authToken).toBe("");
+    expect(resolved.enableThinking).toBe(true);
+    expect(resolved.dumpDir).toBe("");
+    expect(resolved.serverTools).toBeDefined();
     Bun.argv = origArgv;
   });
 });
