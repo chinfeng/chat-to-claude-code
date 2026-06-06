@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "bun:test";
 import { routeRequest } from "../src/server/routes.js";
-import type { ServerConfig } from "../src/server/config.js";
+import type { ResolvedConfig } from "../src/server/config.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -144,14 +144,17 @@ function restoreFetch(): void {
   globalThis.fetch = ORIGINAL_FETCH;
 }
 
-const TEST_CONFIG: ServerConfig = {
-  upstreamBaseUrl: "http://upstream.test",
-  upstreamApiKey: "test-key",
+const TEST_CONFIG: ResolvedConfig = {
+  mode: "single",
+  upstream: {
+    baseUrl: "http://upstream.test",
+    apiKey: "test-key",
+    modelOverrides: [],
+  },
   authToken: "",
   port: 8082,
   enableThinking: true,
   dumpDir: "",
-  modelOverrides: [],
   serverTools: {
     webSearch: false,
     webFetch: false,
@@ -624,7 +627,7 @@ describe("SSE stream forwarding", () => {
     mockFetchWithMidStreamError(goodPrefix, "Connection reset by peer");
 
     const tmpDir = `${import.meta.dir}/.test-dump-finalize-${Date.now()}`;
-    const configWithDump: ServerConfig = {
+    const configWithDump: ResolvedConfig = {
       ...TEST_CONFIG,
       dumpDir: tmpDir,
     };

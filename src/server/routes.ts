@@ -7,8 +7,10 @@ import { streamOpenAIChatToAnthropicSse } from "../transport/stream.js";
 import type { StreamChunk } from "../transport/stream.js";
 import { estimateInputTokens } from "../core/tokens.js";
 import { invalidRequestError, authenticationError, upstreamError, serverError } from "../core/errors.js";
-import type { ServerConfig, ServerToolConfig } from "./config.js";
+import type { ResolvedConfig, ServerToolConfig, ModelOverride } from "./config.js";
 import { resolveModelExtra, deepMerge } from "./config.js";
+import type { UpstreamConfig } from "./route_config.js";
+import { Router, type RouteAlgorithm } from "./router.js";
 import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder } from "../sse/builder.js";
 import { createDumpSession, type DumpTermination, type TerminationReason, type ServerToolLogEntry } from "../core/dump.js";
 import {
@@ -24,24 +26,48 @@ import {
   type DetectedTextToolCall,
 } from "./server_tools.js";
 
-/** Whether passthrough mode is active: no upstream key and no downstream auth token. */
-function isPassthroughMode(config: ServerConfig): boolean {
-  return !config.upstreamApiKey && !config.authToken;
-}
-
 /** Validate downstream auth token when AUTH_TOKEN is configured. */
-function validateAuthToken(request: Request, config: ServerConfig): boolean {
-  if (!config.authToken) return true;
+function validateAuthToken(request: Request, authToken: string): boolean {
+  if (!authToken) return true;
   const clientKey = request.headers.get("x-api-key") || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
-  return clientKey === config.authToken;
+  return clientKey === authToken;
 }
 
-/** Resolve the API key: passthrough from client header, or server config. */
-function resolveApiKey(request: Request, config: ServerConfig): string | null {
-  const clientKey = request.headers.get("x-api-key") || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  if (isPassthroughMode(config) && clientKey) return clientKey;
-  if (config.upstreamApiKey) return config.upstreamApiKey;
-  return null;
+/** A resolved upstream view used by the unified request handler. */
+export interface SelectedUpstream {
+  baseUrl: string;
+  apiKey: string;
+  modelOverrides: ModelOverride[];
+  aliases: Record<string, string>;
+  name: string;
+}
+
+/** Apply alias mapping: if the requested model matches an alias, return the alias target. */
+export function applyAlias(model: string, aliases: Record<string, string>): string {
+  return aliases[model] ?? model;
+}
+
+/** Extract completion_tokens from raw upstream SSE chunks for token-budget deduction. */
+function extractCompletionTokensFromRawChunks(rawChunks: string[]): number {
+  let totalCompletion = 0;
+  for (const chunk of rawChunks) {
+    const lines = chunk.split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const data = trimmed.slice(6).trim();
+      if (data === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed?.usage?.completion_tokens && typeof parsed.usage.completion_tokens === "number") {
+          totalCompletion = parsed.usage.completion_tokens;
+        }
+      } catch {
+        // skip unparseable lines
+      }
+    }
+  }
+  return totalCompletion;
 }
 
 /** Extract request headers as a plain object for dump logging. */
@@ -93,12 +119,12 @@ function parseMessagesBody(body: unknown): { data: RequestData; error?: never } 
 }
 
 /** Build the upstream OpenAI-compatible fetch request. */
-function buildUpstreamRequest(requestData: RequestData, apiKey: string, config: ServerConfig): { request: Request; requestBody: string; requestHeaders: Record<string, string> } {
+function buildUpstreamRequest(requestData: RequestData, apiKey: string, upstreamBaseUrl: string, modelOverrides: ModelOverride[]): { request: Request; requestBody: string; requestHeaders: Record<string, string> } {
   let body = buildBaseRequestBody(requestData, 4096, ReasoningReplayMode.THINK_TAGS);
-  const url = `${config.upstreamBaseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const url = `${upstreamBaseUrl.replace(/\/+$/, "")}/chat/completions`;
   body.stream = true;
 
-  const extra = resolveModelExtra(requestData.model, config.modelOverrides);
+  const extra = resolveModelExtra(requestData.model, modelOverrides);
   if (Object.keys(extra).length) {
     body = deepMerge(body, extra);
   }
@@ -324,13 +350,14 @@ function extractServerToolsFromRequest(requestData: RequestData): Record<string,
 /** Build just the upstream request body (without creating a Request object). */
 function buildUpstreamRequestBodyOnly(
   requestData: RequestData,
-  apiKey: string,
-  config: ServerConfig,
+  selectedUpstream: SelectedUpstream,
+  upstreamBaseUrl: string,
+  modelOverrides: ModelOverride[],
 ): { requestBody: string; requestHeaders: Record<string, string> } {
   let body = buildBaseRequestBody(requestData, 4096, ReasoningReplayMode.THINK_TAGS);
   body.stream = true;
 
-  const extra = resolveModelExtra(requestData.model, config.modelOverrides);
+  const extra = resolveModelExtra(requestData.model, modelOverrides);
   if (Object.keys(extra).length) {
     body = deepMerge(body, extra);
   }
@@ -344,23 +371,57 @@ function buildUpstreamRequestBodyOnly(
 }
 
 /** Handle POST /v1/messages. */
-export async function handleMessages(request: Request, config: ServerConfig): Promise<Response> {
+export async function handleMessages(request: Request, config: ResolvedConfig, router?: Router): Promise<Response> {
   const dump = createDumpSession(config.dumpDir);
   const requestStartMs = Date.now();
   const requestDatetime = new Date().toISOString();
 
   // Validate downstream auth token when configured
-  if (!validateAuthToken(request, config)) {
+  if (!validateAuthToken(request, config.authToken)) {
     const err = authenticationError("Invalid auth token. Provide correct x-api-key header.");
     dump.finish();
     return Response.json(err.json, { status: err.status });
   }
 
-  const apiKey = resolveApiKey(request, config);
-  if (!apiKey) {
-    const err = authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token).");
-    dump.finish();
-    return Response.json(err.json, { status: err.status });
+  // Resolve upstream based on mode
+  let selectedUpstream: SelectedUpstream;
+  let routeLog: string | undefined;
+
+  if (config.mode === "route") {
+    if (!router) {
+      throw new Error("Router is required in route mode");
+    }
+    const selected = router.select();
+    routeLog = router.formatLog(selected.name);
+    console.log(routeLog);
+    selectedUpstream = {
+      baseUrl: selected.baseUrl,
+      apiKey: selected.apiKey,
+      modelOverrides: selected.modelOverrides,
+      aliases: selected.aliases,
+      name: selected.name,
+    };
+  } else {
+    // Single mode
+    const singleUpstream = config.upstream!;
+    // Passthrough: if no upstream key and no auth token, use client's key
+    const isPassthrough = !singleUpstream.apiKey && !config.authToken;
+    const clientKey = request.headers.get("x-api-key") || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+    const resolvedApiKey = isPassthrough && clientKey ? clientKey : singleUpstream.apiKey;
+
+    if (!resolvedApiKey) {
+      const err = authenticationError("No API key provided. Set --upstream-api-key or enable passthrough mode (no upstream key and no auth token).");
+      dump.finish();
+      return Response.json(err.json, { status: err.status });
+    }
+
+    selectedUpstream = {
+      baseUrl: singleUpstream.baseUrl,
+      apiKey: resolvedApiKey,
+      modelOverrides: singleUpstream.modelOverrides,
+      aliases: {},
+      name: "default",
+    };
   }
 
   let body: unknown;
@@ -387,6 +448,11 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   }
 
   const requestData = parsed.data;
+
+  // Apply alias: replace model if alias mapping exists for selected upstream
+  const originalModel = requestData.model;
+  requestData.model = applyAlias(requestData.model, selectedUpstream.aliases);
+
   const inputTokens = estimateInputTokens(requestData.messages);
 
   // --- Server Tool Agentic Loop ---
@@ -400,8 +466,9 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
 
   if (serverToolsEnabled && requestServerTools.length > 0) {
     return await handleServerToolRequest(
-      requestData, apiKey, config, dump, requestStartMs,
+      requestData, selectedUpstream, config, dump, requestStartMs,
       requestHeaders, requestDatetime, request.signal, inputTokens,
+      originalModel, router,
     );
   }
 
@@ -413,7 +480,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   // via the second argument of fetch() because Bun does not propagate
   // Request.signal through fetch(request) to the init layer.
   const abortSignal = request.signal;
-  const { request: upstreamReq, requestBody: upstreamRequestBody, requestHeaders: upstreamReqHeaders } = buildUpstreamRequest(requestData, apiKey, config);
+  const { request: upstreamReq, requestBody: upstreamRequestBody, requestHeaders: upstreamReqHeaders } = buildUpstreamRequest(requestData, selectedUpstream.apiKey, selectedUpstream.baseUrl, selectedUpstream.modelOverrides);
 
   // Log upstream request (what the proxy sends to the upstream API)
   dump.writeUpstreamRequest({
@@ -519,6 +586,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   let downstreamAborted = false;
   let dumpFinished = false;
   let terminationReason: TerminationReason = "completed";
+  let completionTokens = 0;
 
   /** Write dump logs and finish. Safe to call from both start() and cancel()
    * — the finished guard prevents double writes. */
@@ -543,6 +611,11 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
       dump.setTiming({ ttfb, totalTime: Date.now() - requestStartMs });
     }
     dump.finish();
+
+    // Token-budget deduction after response completes
+    if (router && config.mode === "route" && completionTokens > 0) {
+      router.deduct(selectedUpstream.name, completionTokens);
+    }
   }
 
   const downstreamHeaders: Record<string, string> = {
@@ -578,7 +651,9 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
             }
           }
         } finally {
-          finalizeDump();
+          // Extract completion tokens from raw upstream chunks for token-budget deduction
+      completionTokens = extractCompletionTokensFromRawChunks(rawUpstreamChunks);
+      finalizeDump();
           try { controller.close(); } catch { /* already closed by cancel */ }
         }
       })();
@@ -610,21 +685,23 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
  */
 async function handleServerToolRequest(
     requestData: RequestData,
-    apiKey: string,
-    config: ServerConfig,
+    selectedUpstream: SelectedUpstream,
+    config: ResolvedConfig,
     dump: ReturnType<typeof createDumpSession>,
     requestStartMs: number,
     requestHeaders: Record<string, string>,
     requestDatetime: string,
     abortSignal: AbortSignal,
     inputTokens: number,
+  originalModel: string,
+  router?: Router,
 ): Promise<Response> {
     const MAX_ITERATIONS = 5;
     const onLog = dump.logServerTool.bind(dump);
 
     // Build the initial upstream request body
     const { requestBody: initialBody, requestHeaders: upstreamReqHeaders } =
-        buildUpstreamRequestBodyOnly(requestData, apiKey, config);
+        buildUpstreamRequestBodyOnly(requestData, selectedUpstream.apiKey, selectedUpstream.baseUrl, selectedUpstream.modelOverrides);
 
     dump.writeUpstreamRequest({
         headers: upstreamReqHeaders,
@@ -636,10 +713,10 @@ async function handleServerToolRequest(
     const initialBodyParsed = JSON.parse(initialBody) as Record<string, unknown>;
     let upstreamMessages = [...(initialBodyParsed.messages as Record<string, unknown>[])];
     const upstreamTools = initialBodyParsed.tools;
-    const upstreamUrl = `${config.upstreamBaseUrl.replace(/\/+$/, "")}/chat/completions`;
+    const upstreamUrl = `${selectedUpstream.baseUrl.replace(/\/+$/, "")}/chat/completions`;
     const upstreamHeadersObj: Record<string, string> = {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
+        "Authorization": `Bearer ${selectedUpstream.apiKey}`,
     };
 
     type ServerToolEvent = {
@@ -1092,7 +1169,7 @@ async function handleServerToolRequest(
 }
 
 /** Route a request to the appropriate handler. */
-export async function routeRequest(request: Request, config: ServerConfig): Promise<Response> {
+export async function routeRequest(request: Request, config: ResolvedConfig, router?: Router): Promise<Response> {
   const url = new URL(request.url);
 
   // Health check
@@ -1102,7 +1179,7 @@ export async function routeRequest(request: Request, config: ServerConfig): Prom
 
   // Anthropic Messages API
   if (url.pathname === "/v1/messages" && request.method === "POST") {
-    return handleMessages(request, config);
+    return handleMessages(request, config, router);
   }
 
   // Fallback
