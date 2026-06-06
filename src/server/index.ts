@@ -1,9 +1,16 @@
 /** Bun.serve() entry point for chat-to-claude-code. */
 
-import { loadConfig } from "./config.js";
+import { resolveConfig, type ResolvedConfig } from "./config.js";
 import { routeRequest } from "./routes.js";
+import { Router } from "./router.js";
 
-const config = loadConfig();
+const config = resolveConfig();
+
+// Create router for route mode
+let router: Router | undefined;
+if (config.mode === "route" && config.route) {
+  router = new Router(config.route.algorithm, config.route.upstreams);
+}
 
 const server = Bun.serve({
   port: config.port,
@@ -22,7 +29,7 @@ const server = Bun.serve({
       });
     }
 
-    const response = await routeRequest(request, config);
+    const response = await routeRequest(request, config, router);
 
     // Add CORS headers to all responses
     response.headers.set("Access-Control-Allow-Origin", "*");
@@ -30,17 +37,40 @@ const server = Bun.serve({
   },
 });
 
-const passthrough = !config.upstreamApiKey && !config.authToken;
+// Startup display
 console.log(`chat-to-claude-code listening on http://localhost:${server.port}`);
-console.log(`  Upstream: ${config.upstreamBaseUrl}`);
-console.log(`  Upstream API key: ${config.upstreamApiKey ? "configured" : "not set"}`);
+console.log(`  Mode: ${config.mode}`);
+
+if (config.mode === "single" && config.upstream) {
+  console.log(`  Upstream: ${config.upstream.baseUrl}`);
+  console.log(`  Upstream API key: ${config.upstream.apiKey ? "configured" : "not set"}`);
+  const passthrough = !config.upstream.apiKey && !config.authToken;
+  console.log(`  Passthrough mode: ${passthrough}`);
+} else if (config.mode === "route" && config.route) {
+  console.log(`  Algorithm: ${config.route.algorithm}`);
+  console.log(`  Upstreams:`);
+  for (const u of config.route.upstreams) {
+    const parts = [`name=${u.name}`, `url=${u.baseUrl}`, `key=${u.apiKey ? "configured" : "not set"}`];
+    if (config.route.algorithm === "weighted" || u.weight !== 1) {
+      parts.push(`weight=${u.weight}`);
+    }
+    if (config.route.algorithm === "token-budget" && u.tokenBudget > 0) {
+      parts.push(`budget=${u.tokenBudget}`);
+    }
+    const aliasCount = Object.keys(u.aliases).length;
+    if (aliasCount > 0) {
+      parts.push(`aliases=${aliasCount}`);
+    }
+    console.log(`    ${parts.join(", ")}`);
+  }
+}
+
 console.log(`  Auth token: ${config.authToken ? "configured" : "not set"}`);
-console.log(`  Passthrough mode: ${passthrough}`);
 console.log(`  Thinking: ${config.enableThinking}`);
 console.log(`  Dump: ${config.dumpDir || "disabled"}`);
-if (config.modelOverrides.length) {
+if (config.mode === "single" && config.upstream?.modelOverrides.length) {
   console.log(`  Model overrides:`);
-  for (const entry of config.modelOverrides) {
+  for (const entry of config.upstream.modelOverrides) {
     console.log(`    ${entry.pattern} -> ${JSON.stringify(entry.extra)}`);
   }
 }
