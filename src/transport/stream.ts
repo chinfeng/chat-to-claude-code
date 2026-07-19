@@ -168,18 +168,18 @@ export async function* streamOpenAIChatToAnthropicSse(
       }
     }
   } catch (e) {
-    const errorMessage = e instanceof Error ? e.message : String(e);
+    // Close any content blocks opened so far, leaving the downstream stream
+    // well-formed up to the failure point. Then rethrow: the route layer is
+    // responsible for emitting a top-level `event: error` and marking the
+    // dump termination as upstream_abort.
+    //
+    // We deliberately do NOT wrap the error message in a `text` content block
+    // and do NOT emit message_delta(end_turn) + message_stop. Doing so would
+    // disguise the failure as a completed assistant turn, causing clients
+    // (e.g. Claude Code) to persist the error string into conversation
+    // history and poison subsequent turns. See dump/ for real occurrences.
     for (const event of sse.close_all_blocks()) yield event;
-    if (sse.blocks.hasEmittedToolBlock()) {
-      yield sse.emit_top_level_error(errorMessage);
-    } else {
-      for (const event of sse.emit_error(errorMessage)) yield event;
-    }
-    if (!options?.skipMessageLifecycle) {
-      yield sse.message_delta("end_turn", 1);
-      yield sse.message_stop();
-    }
-    return;
+    throw e;
   }
 
   // Flush remaining content

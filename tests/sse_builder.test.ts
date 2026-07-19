@@ -142,14 +142,6 @@ describe("SSEBuilder", () => {
     expect(tokens).toBeGreaterThan(0);
   });
 
-  it("emit_error produces text block with error message", () => {
-    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
-    const events: string[] = [];
-    for (const e of sse.emit_error("Something broke")) events.push(e);
-    expect(events.length).toBe(3); // start + delta + stop
-    expect(events[1]).toContain("Something broke");
-  });
-
   it("emit_top_level_error produces error event", () => {
     const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
     const event = sse.emit_top_level_error("Fatal");

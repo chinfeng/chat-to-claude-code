@@ -151,7 +151,7 @@ describe("streamOpenAIChatToAnthropicSse", () => {
     expect(output).toContain("event: message_stop");
   });
 
-  it("handles error in upstream stream", async () => {
+  it("rethrows upstream stream error instead of disguising it as assistant text", async () => {
     async function* errorStream(): AsyncIterable<StreamChunk> {
       yield { choices: [{ delta: { content: "partial" }, finish_reason: null }] };
       throw new Error("upstream disconnected");
@@ -164,9 +164,77 @@ describe("streamOpenAIChatToAnthropicSse", () => {
       true,
     );
 
-    const output = await collectStream(stream);
-    expect(output).toContain("upstream disconnected");
-    expect(output).toContain("event: message_stop");
+    // The converter must surface the failure by rethrowing so the route layer
+    // can emit a top-level SSE `event: error` and mark the termination reason.
+    // The original bug swallowed the error, wrapped its message in a `text`
+    // content block, and signalled `end_turn` + `message_stop` — making the
+    // client treat the failure as a completed assistant turn and persist the
+    // error string into conversation history.
+    await expect(collectStream(stream)).rejects.toThrow("upstream disconnected");
+  });
+
+  it("closes any opened content blocks before rethrowing an upstream stream error", async () => {
+    async function* errorStream(): AsyncIterable<StreamChunk> {
+      // reasoning_content eagerly opens a thinking block (no parser buffering),
+      // so we can verify that an opened block is closed before the rethrow.
+      yield { choices: [{ delta: { reasoning_content: "thinking..." }, finish_reason: null }] };
+      throw new Error("upstream disconnected");
+    }
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      errorStream(),
+      TEST_REQUEST,
+      10,
+      true,
+    );
+
+    let collected = "";
+    await expect(async () => {
+      try {
+        for await (const chunk of stream) collected += chunk;
+      } catch {
+        // expected rethrow
+      }
+    }).not.toThrow();
+
+    // A thinking block was opened, so it must be closed before the error
+    // propagates — downstream parsers must see a well-formed stream up to the
+    // failure point (no dangling open block).
+    const starts = (collected.match(/event: content_block_start/g) || []).length;
+    const stops = (collected.match(/event: content_block_stop/g) || []).length;
+    expect(starts).toBeGreaterThan(0);
+    expect(stops).toBeGreaterThanOrEqual(starts);
+  });
+
+  it("does not fabricate error-as-text or end_turn when no content arrived before failure", async () => {
+    // Error fires before any content delta arrives — no block is open. The
+    // converter must surface the failure by rethrowing and must NOT fabricate
+    // a text block carrying the error message (the original bug) nor pretend
+    // the turn completed with end_turn + message_stop.
+    async function* errorStream(): AsyncIterable<StreamChunk> {
+      throw new Error("upstream disconnected");
+    }
+
+    const stream = streamOpenAIChatToAnthropicSse(
+      errorStream(),
+      TEST_REQUEST,
+      10,
+      true,
+    );
+
+    let collected = "";
+    await expect(async () => {
+      try {
+        for await (const chunk of stream) collected += chunk;
+      } catch {
+        // expected rethrow
+      }
+    }).not.toThrow();
+
+    expect(collected).not.toContain("text_delta");
+    expect(collected).not.toContain("upstream disconnected");
+    expect(collected).not.toContain("end_turn");
+    expect(collected).not.toContain("event: message_stop");
   });
 
   it("handles think tags in content", async () => {

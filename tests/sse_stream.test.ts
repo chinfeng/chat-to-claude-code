@@ -399,9 +399,32 @@ describe("SSE stream forwarding", () => {
     expect(res.status).toBe(200);
 
     const body = await collectResponseBody(res);
-    // The error must appear in the downstream stream — not silently swallowed
-    expect(body).toContain("Upstream stream read error");
-    expect(body).toContain("Connection reset by peer");
+
+    // The error must surface as a real top-level SSE `event: error`, not be
+    // silently swallowed. We verify the event type explicitly so that merely
+    // embedding the error string somewhere in the body does not satisfy this.
+    const events = parseSseResponse(body);
+    const eventTypes = events.map((e) => e.event);
+    expect(eventTypes).toContain("error");
+
+    const errorEvents = events.filter((e) => e.event === "error");
+    expect(errorEvents.length).toBeGreaterThan(0);
+    expect(errorEvents.some((e) => e.data.includes("Upstream stream read error"))).toBe(true);
+    expect(errorEvents.some((e) => e.data.includes("Connection reset by peer"))).toBe(true);
+
+    // CRITICAL: The error must NOT be disguised as assistant text content.
+    // The original bug wrapped the error message in a `text` content block
+    // (content_block_start "text" + text_delta) and then signalled `end_turn`,
+    // which made Claude Code treat the failure as a normal completed turn and
+    // store the error string into conversation history — poisoning subsequent
+    // turns. Assert the error never appears inside any text_delta.
+    expect(body).not.toMatch(/text_delta[^}]*Upstream stream read error/);
+    expect(body).not.toMatch(/text_delta[^}]*Connection reset by peer/);
+
+    // And the message must not be falsely reported as a successful turn.
+    // After an error there must be no message_delta claiming end_turn.
+    const messageDeltas = events.filter((e) => e.event === "message_delta" && e.data.includes("end_turn"));
+    expect(messageDeltas.length).toBe(0);
   });
 
   // -----------------------------------------------------------------------

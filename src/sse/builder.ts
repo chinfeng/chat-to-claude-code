@@ -320,13 +320,6 @@ export class SSEBuilder {
     }
   }
 
-  *emit_error(errorMessage: string): Generator<string> {
-    const errorIndex = this.blocks.allocateIndex();
-    yield this.content_block_start(errorIndex, "text");
-    yield this.content_block_delta(errorIndex, "text_delta", errorMessage);
-    yield this.content_block_stop(errorIndex);
-  }
-
   /** Emit a complete server_tool_use content block (non-streaming — all data at once). */
   *emit_server_tool_use(
     toolId: string,
