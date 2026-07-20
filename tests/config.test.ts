@@ -98,6 +98,138 @@ describe("deepMerge", () => {
     expect(result).toEqual({ x: { y: 1, z: 2 } });
     expect(target).toEqual({ x: { y: 1 } });
   });
+
+  // ---- $delete ----
+
+  it("$delete removes top-level keys", () => {
+    const result = deepMerge(
+      { a: 1, b: 2, c: 3 },
+      { $delete: ["a", "c"] },
+    );
+    expect(result).toEqual({ b: 2 });
+  });
+
+  it("$delete with dot-notation path removes nested keys", () => {
+    const result = deepMerge(
+      { thinking: { type: "enabled", budget_tokens: 10000 } },
+      { $delete: ["thinking.budget_tokens"] },
+    );
+    expect(result).toEqual({ thinking: { type: "enabled" } });
+  });
+
+  it("$delete silently no-ops when path does not exist", () => {
+    const result = deepMerge(
+      { a: 1 },
+      { $delete: ["b", "c.d.e"] },
+    );
+    expect(result).toEqual({ a: 1 });
+  });
+
+  it("$delete at nested level removes keys relative to that level", () => {
+    const result = deepMerge(
+      { thinking: { type: "enabled", budget_tokens: 10000, extra: "x" } },
+      { thinking: { $delete: ["budget_tokens", "extra"] } },
+    );
+    expect(result).toEqual({ thinking: { type: "enabled" } });
+  });
+
+  it("$delete non-array values are ignored (no-op)", () => {
+    const result = deepMerge(
+      { a: 1 },
+      { $delete: "not-an-array" } as any,
+    );
+    expect(result).toEqual({ a: 1 });
+  });
+
+  // ---- $default ----
+
+  it("$default sets missing top-level keys", () => {
+    const result = deepMerge(
+      { existing: 1 },
+      { $default: { max_tokens: 4096, temperature: 0.7 } },
+    );
+    expect(result).toEqual({ existing: 1, max_tokens: 4096, temperature: 0.7 });
+  });
+
+  it("$default does not overwrite existing keys", () => {
+    const result = deepMerge(
+      { max_tokens: 2048 },
+      { $default: { max_tokens: 4096, temperature: 0.7 } },
+    );
+    expect(result).toEqual({ max_tokens: 2048, temperature: 0.7 });
+  });
+
+  it("$default with dot-notation path sets nested defaults", () => {
+    const result = deepMerge(
+      { thinking: { type: "enabled" } },
+      { $default: { "thinking.budget_tokens": 10000 } },
+    );
+    expect(result).toEqual({ thinking: { type: "enabled", budget_tokens: 10000 } });
+  });
+
+  it("$default with dot-notation does not overwrite existing nested values", () => {
+    const result = deepMerge(
+      { thinking: { type: "enabled", budget_tokens: 5000 } },
+      { $default: { "thinking.budget_tokens": 10000 } },
+    );
+    expect(result).toEqual({ thinking: { type: "enabled", budget_tokens: 5000 } });
+  });
+
+  it("$default creates intermediate objects for missing paths", () => {
+    const result = deepMerge(
+      { a: 1 },
+      { $default: { "thinking.type": "enabled" } },
+    );
+    expect(result).toEqual({ a: 1, thinking: { type: "enabled" } });
+  });
+
+  it("$default nested level applies relative to that level", () => {
+    const result = deepMerge(
+      { thinking: { type: "enabled" } },
+      { thinking: { $default: { budget_tokens: 10000 } } },
+    );
+    expect(result).toEqual({ thinking: { type: "enabled", budget_tokens: 10000 } });
+  });
+
+  // ---- mix: $delete + $default + regular merge ----
+
+  it("mixes $delete, $default, and regular merge (order: merge → default → delete)", () => {
+    const result = deepMerge(
+      { keep: 1, user: "old", seed: 42 },
+      { $delete: ["user", "seed"], $default: { max_tokens: 4096 }, temperature: 0.2 },
+    );
+    // merge: {keep:1, user:"old", seed:42, temperature:0.2}
+    // default: +max_tokens:4096
+    // delete: -user, -seed
+    expect(result).toEqual({ keep: 1, temperature: 0.2, max_tokens: 4096 });
+  });
+
+  it("$default sees values set by regular merge (won't overwrite them)", () => {
+    const result = deepMerge(
+      {},
+      { max_tokens: 2048, $default: { max_tokens: 4096 } },
+    );
+    // merge sets max_tokens=2048 first, so $default skips it
+    expect(result).toEqual({ max_tokens: 2048 });
+  });
+
+  it("$delete can remove keys set by $default or merge", () => {
+    const result = deepMerge(
+      {},
+      { $default: { max_tokens: 4096 }, $delete: ["max_tokens"] },
+    );
+    expect(result).toEqual({});
+  });
+
+  it("$delete and $default keys themselves do not appear in result", () => {
+    const result = deepMerge(
+      { a: 1 },
+      { $delete: ["b"], $default: { c: 2 } },
+    );
+    expect(result).not.toHaveProperty("$delete");
+    expect(result).not.toHaveProperty("$default");
+    expect(result).toEqual({ a: 1, c: 2 });
+  });
 });
 
 describe("loadConfig", () => {

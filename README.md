@@ -198,7 +198,17 @@ Use `--upstream-extra-params` to inject additional JSON fields into the upstream
 
 - **Glob pattern** — `*` matches any characters, `?` matches a single character. The first matching pattern wins.
 - **JSON value** — Must be a JSON object. Deep-merged into the upstream request body (nested objects are merged, arrays are replaced).
-- **Repeatable** — Specify multiple times for different model patterns:
+- **Repeatable** — Specify multiple times for different model patterns.
+- **Processing order** — Regular merge → `$default` (fill missing) → `$delete` (remove).
+
+#### Meta-operation keys
+
+Two reserved keys prefixed with `$` control advanced behaviours (all other keys follow standard deep-merge: nested objects merged, arrays replaced, `null` overwrites):
+
+| Key | Type | Semantics |
+|-----|------|-----------|
+| `$delete` | `string[]` | Remove properties at the given **dot-notation paths** from the merged result. Silently no-ops when a path does not exist. |
+| `$default` | `Record<string, any>` | Set values **only when the path is missing** (`undefined`) in the target. Existing values are never overwritten. Supports dot-notation paths for nested defaults. |
 
 ```bash
 bun run src/server/index.ts \
@@ -210,6 +220,46 @@ bun run src/server/index.ts \
 ```
 
 When a request arrives with `model: "claude-sonnet-4-20250514"`, the matching `claude-sonnet-*` pattern is selected and its JSON is merged into the upstream request body. The catch-all `*` pattern acts as a default for any unmatched model.
+
+##### Examples
+
+**Delete top-level or nested parameters:**
+
+```bash
+# Remove top-level keys
+--upstream-extra-params 'deepseek*={"$delete":["top_p","presence_penalty"],"reasoning_effort":"high"}'
+
+# Remove nested keys via dot-notation path
+--upstream-extra-params 'claude-*={"$delete":["thinking.budget_tokens"]}'
+
+# Remove nested keys via a nested $delete (paths relative to that level)
+--upstream-extra-params 'claude-*={"thinking":{"$delete":["budget_tokens"],"type":"enabled"}}'
+```
+
+**Provide defaults for missing parameters (won't overwrite existing values):**
+
+```bash
+# Only set max_tokens if the upstream body doesn't already have it
+--upstream-extra-params '*={"$default":{"max_tokens":4096,"temperature":0.7}}'
+
+# Nested defaults via dot-notation
+--upstream-extra-params 'claude-*={"$default":{"thinking.budget_tokens":10000}}'
+
+# Nested defaults via nested $default
+--upstream-extra-params 'claude-*={"thinking":{"$default":{"budget_tokens":10000}}}'
+```
+
+**Set a parameter to `null` (uses standard JSON `null`):**
+
+```bash
+--upstream-extra-params 'claude-*={"top_p":null}'
+```
+
+**Mix all three — delete, default, and override in one rule:**
+
+```bash
+--upstream-extra-params '*={"$delete":["user","seed"],"$default":{"max_tokens":4096},"temperature":0.2}'
+```
 
 ### Passthrough Mode
 

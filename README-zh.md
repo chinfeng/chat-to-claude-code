@@ -198,7 +198,17 @@ bun run src/server/index.ts \
 
 - **glob 模式** — `*` 匹配任意字符，`?` 匹配单个字符。第一个匹配的模式生效。
 - **JSON 值** — 必须是 JSON 对象。会深层合并（deep merge）到上游请求体中：嵌套对象逐层合并，数组直接替换。
-- **可重复指定** — 多次使用以配置不同模型：
+- **可重复指定** — 多次使用以配置不同模型。
+- **处理顺序** — 常规合并 → `$default`（补默认值）→ `$delete`（删除属性）。
+
+#### 元操作键
+
+两个以 `$` 为前缀的保留键用于高级控制（其余键为标准 deep merge 行为：嵌套对象合并，数组替换，`null` 直接覆盖）：
+
+| 键 | 类型 | 语义 |
+|---|------|------|
+| `$delete` | `string[]` | 从合并结果中删除指定**点号路径**的属性。路径不存在时静默忽略。 |
+| `$default` | `Record<string, any>` | 仅在路径**缺失**（`undefined`）时才写入值。已有值不会被覆盖。支持点号路径设置嵌套默认值。 |
 
 ```bash
 bun run src/server/index.ts \
@@ -210,6 +220,46 @@ bun run src/server/index.ts \
 ```
 
 当请求携带 `model: "claude-sonnet-4-20250514"` 到达时，匹配到 `claude-sonnet-*` 模式，其 JSON 会被合并到上游请求体中。`*` 通配符可作为所有未匹配模型的默认规则。
+
+##### 示例
+
+**删除顶层或嵌套参数：**
+
+```bash
+# 删除顶层 key
+--upstream-extra-params 'deepseek*={"$delete":["top_p","presence_penalty"],"reasoning_effort":"high"}'
+
+# 通过点号路径删除嵌套 key
+--upstream-extra-params 'claude-*={"$delete":["thinking.budget_tokens"]}'
+
+# 通过嵌套 $delete 删除（路径相对于当前层级）
+--upstream-extra-params 'claude-*={"thinking":{"$delete":["budget_tokens"],"type":"enabled"}}'
+```
+
+**为缺失的参数提供默认值（不会覆盖已有值）：**
+
+```bash
+# 仅在上游请求体没有 max_tokens 时才设置
+--upstream-extra-params '*={"$default":{"max_tokens":4096,"temperature":0.7}}'
+
+# 通过点号路径设置嵌套默认值
+--upstream-extra-params 'claude-*={"$default":{"thinking.budget_tokens":10000}}'
+
+# 通过嵌套 $default 设置
+--upstream-extra-params 'claude-*={"thinking":{"$default":{"budget_tokens":10000}}}'
+```
+
+**将参数设为 `null`（使用标准 JSON `null`）：**
+
+```bash
+--upstream-extra-params 'claude-*={"top_p":null}'
+```
+
+**混合使用 — 删除、默认值、覆盖三合一：**
+
+```bash
+--upstream-extra-params '*={"$delete":["user","seed"],"$default":{"max_tokens":4096},"temperature":0.2}'
+```
 
 ### 透传模式
 
