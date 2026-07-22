@@ -380,11 +380,11 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 4: upstream read error propagation (no silent failure on
-  //         network/proxy disconnection)
+  // Bug 4: upstream connection abort propagates to the downstream client as
+  //         an abrupt stream close (no fabricated terminal marker)
   // -----------------------------------------------------------------------
 
-  it("propagates upstream read error as SSE error event instead of silent failure", async () => {
+  it("propagates an upstream connection abort as an abrupt SSE close instead of an error event", async () => {
     const goodPrefix = sseData({
       id: "chatcmpl-err",
       object: "chat.completion.chunk",
@@ -399,32 +399,29 @@ describe("SSE stream forwarding", () => {
     expect(res.status).toBe(200);
 
     const body = await collectResponseBody(res);
-
-    // The error must surface as a real top-level SSE `event: error`, not be
-    // silently swallowed. We verify the event type explicitly so that merely
-    // embedding the error string somewhere in the body does not satisfy this.
     const events = parseSseResponse(body);
     const eventTypes = events.map((e) => e.event);
-    expect(eventTypes).toContain("error");
 
-    const errorEvents = events.filter((e) => e.event === "error");
-    expect(errorEvents.length).toBeGreaterThan(0);
-    expect(errorEvents.some((e) => e.data.includes("Upstream stream read error"))).toBe(true);
-    expect(errorEvents.some((e) => e.data.includes("Connection reset by peer"))).toBe(true);
+    // The stream begins: message_start is always emitted up front. Under
+    // enableThinking the prefix content delta is buffered by the ThinkTagParser
+    // and only flushed on normal completion; on abort we propagate the close
+    // instead of fabricating a partial block, so the prefix text is left
+    // unflushed and need not appear.
+    expect(eventTypes).toContain("message_start");
 
-    // CRITICAL: The error must NOT be disguised as assistant text content.
-    // The original bug wrapped the error message in a `text` content block
-    // (content_block_start "text" + text_delta) and then signalled `end_turn`,
-    // which made Claude Code treat the failure as a normal completed turn and
-    // store the error string into conversation history — poisoning subsequent
-    // turns. Assert the error never appears inside any text_delta.
-    expect(body).not.toMatch(/text_delta[^}]*Upstream stream read error/);
-    expect(body).not.toMatch(/text_delta[^}]*Connection reset by peer/);
-
-    // And the message must not be falsely reported as a successful turn.
-    // After an error there must be no message_delta claiming end_turn.
-    const messageDeltas = events.filter((e) => e.event === "message_delta" && e.data.includes("end_turn"));
-    expect(messageDeltas.length).toBe(0);
+    // An upstream connection abort must propagate to the downstream client as
+    // an abrupt stream close — NOT be converted into a downstream terminal
+    // marker. No `event: error`, no message_delta/message_stop (no
+    // self-defined finish_reason), no [DONE]. The original behavior either
+    // emitted `event: error` or faked `end_turn` + `message_stop`, both of
+    // which let the client (e.g. Claude Code) treat the failure as a normal
+    // completed turn and poison conversation history.
+    expect(eventTypes).not.toContain("error");
+    expect(eventTypes).not.toContain("message_delta");
+    expect(eventTypes).not.toContain("message_stop");
+    expect(body).not.toContain("[DONE]");
+    expect(body).not.toContain("Upstream stream read error");
+    expect(body).not.toContain("Connection reset by peer");
   });
 
   // -----------------------------------------------------------------------
@@ -656,10 +653,11 @@ describe("SSE stream forwarding", () => {
       const res = await routeRequest(makeMessagesRequest(), configWithDump);
       expect(res.status).toBe(200);
 
-      // Read the full response — the upstream error should appear as an
-      // SSE error event, and finalizeDump should have been called
+      // Read the full response — the upstream abort propagates as an abrupt
+      // stream close (no fabricated terminal marker), and finalizeDump must
+      // still run.
       const body = await collectResponseBody(res);
-      expect(body).toContain("Upstream stream read error");
+      expect(body).not.toContain("Upstream stream read error");
 
       // Verify dump was finalized: directory renamed with __START_ and __END_
       const { readdirSync } = await import("node:fs");

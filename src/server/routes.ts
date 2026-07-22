@@ -3,7 +3,7 @@
 import { randomUUID } from "crypto";
 import { buildBaseRequestBody, ReasoningReplayMode } from "../conversion/converter.js";
 import type { RequestData } from "../conversion/converter.js";
-import { streamOpenAIChatToAnthropicSse } from "../transport/stream.js";
+import { streamOpenAIChatToAnthropicSse, UpstreamAbortedError } from "../transport/stream.js";
 import type { StreamChunk } from "../transport/stream.js";
 import { estimateInputTokens } from "../core/tokens.js";
 import { invalidRequestError, authenticationError, upstreamError, serverError } from "../core/errors.js";
@@ -147,9 +147,13 @@ async function* iterUpstreamChunks(
       try {
         ({ done, value } = await reader.read());
       } catch (e) {
-        // Network error or proxy disconnection mid-stream — propagate as error
+        // Upstream connection dropped mid-stream (reset/abort). Propagate as
+        // UpstreamAbortedError so the route layer closes the downstream SSE
+        // without fabricating a terminal marker (no error event / self-defined
+        // finish_reason / [DONE]) — the abort propagates to the downstream
+        // client verbatim as an abrupt stream end.
         const msg = e instanceof Error ? e.message : String(e);
-        throw new Error(`Upstream stream read error: ${msg}`);
+        throw new UpstreamAbortedError(`Upstream stream read error: ${msg}`);
       }
       if (done) break;
 
@@ -571,10 +575,18 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
           } catch (e) {
             if (!downstreamAborted) {
               terminationReason = "upstream_abort";
-              const msg = e instanceof Error ? e.message : String(e);
-              const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
-              downstreamChunks.push(errLine);
-              try { controller.enqueue(encoder.encode(errLine)); } catch { /* stream already closed */ }
+              if (!(e instanceof UpstreamAbortedError)) {
+                // Non-connection failure (e.g. upstream embedded an error
+                // object, or an unexpected internal error): surface it as an
+                // explicit `event: error`. An upstream connection abort
+                // (UpstreamAbortedError) propagates verbatim — no error event,
+                // no finish_reason, no [DONE] — just the SSE close in `finally`,
+                // so the downstream client sees the same abrupt end.
+                const msg = e instanceof Error ? e.message : String(e);
+                const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
+                downstreamChunks.push(errLine);
+                try { controller.enqueue(encoder.encode(errLine)); } catch { /* stream already closed */ }
+              }
             }
           }
         } finally {
@@ -1064,7 +1076,13 @@ async function handleServerToolRequest(
                 });
                 dump.setTiming({ ttfb: Date.now() - requestStartMs, totalTime: Date.now() - requestStartMs });
             } catch (e) {
-                if (!abortSignal?.aborted) {
+                if (!abortSignal?.aborted && !(e instanceof UpstreamAbortedError)) {
+                    // Non-connection failure (e.g. tool execution error, or an
+                    // unexpected error): surface it as `event: error`. An
+                    // upstream connection abort (UpstreamAbortedError) —
+                    // including the final stream ending without a finish_reason
+                    // — propagates verbatim: no error event, no finish_reason,
+                    // no [DONE], just the SSE close in `finally`.
                     const msg = e instanceof Error ? e.message : String(e);
                     const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
                     try { emit(errLine); } catch { /* stream closed */ }

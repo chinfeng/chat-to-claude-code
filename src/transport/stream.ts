@@ -17,6 +17,25 @@ export class UpstreamStreamError extends Error {
   }
 }
 
+/**
+ * Thrown when the upstream CONNECTION terminates mid-stream — either a read
+ * error/reset (the upstream socket was closed unexpectedly) or a clean EOF
+ * with no `finish_reason` (the upstream closed without completing the
+ * generation). Propagated to the route layer, which closes the downstream SSE
+ * WITHOUT fabricating a terminal marker: no `event: error`, no
+ * message_delta/message_stop (no self-defined finish_reason), no [DONE] — so
+ * the abort propagates to the downstream client as an abrupt stream end.
+ *
+ * Contrast with UpstreamStreamError (upstream sent an explicit error object
+ * while still connected), which still surfaces downstream as `event: error`.
+ */
+export class UpstreamAbortedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UpstreamAbortedError";
+  }
+}
+
 export interface StreamChunk {
   choices?: {
     delta: {
@@ -167,18 +186,36 @@ export async function* streamOpenAIChatToAnthropicSse(
         }
       }
     }
+
+    // If the upstream stream ended WITHOUT a real `finish_reason`, the upstream
+    // terminated the connection without completing the generation (a clean TCP
+    // close after the last chunk, but no final finish_reason chunk). Propagate
+    // that as an abort — do NOT flush partial buffered state and do NOT
+    // fabricate message_delta/message_stop (no self-defined finish_reason).
+    // The route layer closes the downstream SSE so the client sees the same
+    // abrupt end the upstream produced.
+    if (finishReason == null) {
+      throw new UpstreamAbortedError(
+        "Upstream stream ended without a finish_reason (connection terminated mid-generation).",
+      );
+    }
   } catch (e) {
-    // Close any content blocks opened so far, leaving the downstream stream
-    // well-formed up to the failure point. Then rethrow: the route layer is
-    // responsible for emitting a top-level `event: error` and marking the
-    // dump termination as upstream_abort.
+    // On an upstream connection abort (reset, or clean EOF without a finish
+    // reason), propagate the termination verbatim: stop emitting immediately
+    // and rethrow. We do NOT close content blocks or emit message_delta/stop
+    // — the route layer just closes the downstream SSE so the client sees the
+    // same abrupt end, with no self-defined finish_reason, no error event,
+    // no [DONE] (see UpstreamAbortedError).
     //
-    // We deliberately do NOT wrap the error message in a `text` content block
-    // and do NOT emit message_delta(end_turn) + message_stop. Doing so would
-    // disguise the failure as a completed assistant turn, causing clients
-    // (e.g. Claude Code) to persist the error string into conversation
-    // history and poison subsequent turns. See dump/ for real occurrences.
-    for (const event of sse.close_all_blocks()) yield event;
+    // For a non-abort failure (e.g. the upstream embedded an error object in
+    // the data), close any open content blocks first so the prefix is
+    // well-formed, then rethrow — the route layer surfaces it as an explicit
+    // `event: error`. We deliberately do NOT fake message_delta(end_turn) +
+    // message_stop for these either: disguising a failure as a completed
+    // assistant turn poisons conversation history. See dump/ for occurrences.
+    if (!(e instanceof UpstreamAbortedError)) {
+      for (const event of sse.close_all_blocks()) yield event;
+    }
     throw e;
   }
 
