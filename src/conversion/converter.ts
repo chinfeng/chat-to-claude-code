@@ -158,13 +158,34 @@ function _convertAssistantMessage(
     } else if (blockType === "thinking") {
       if (reasoningReplay === ReasoningReplayMode.DISABLED) continue;
       const thinking = String(getBlockAttr(block, "thinking", "") ?? "");
+      // Preserve the signature as base64-encoded opaque data within the
+      // reasoning replay so it round-trips across turns. We wrap it as a
+      // prefix delimiter in the think_tags output: the proxy recognizes
+      // it on re-ingestion and strips it from the visible content.
+      const signature = String(getBlockAttr(block, "signature", "") ?? "");
       if (reasoningReplay === ReasoningReplayMode.THINK_TAGS) {
-        contentParts.push(thinkTagContent(thinking));
+        const tagged = signature
+          ? `<!--sig:${signature}-->\n${thinkTagContent(thinking)}`
+          : thinkTagContent(thinking);
+        contentParts.push(tagged);
       } else if (reasoningContent === null) {
         thinkingParts.push(thinking);
+        if (signature) {
+          // Stash signature as a hidden prefix in the first thinking part
+          thinkingParts.push(`<!--sig:${signature}-->`);
+        }
       }
     } else if (blockType === "redacted_thinking") {
-      continue;
+      if (reasoningReplay === ReasoningReplayMode.DISABLED) continue;
+      // Preserve redacted thinking as an opaque placeholder so multi-turn
+      // thinking chain verification doesn't break: replay "[redacted thinking]"
+      // in the reasoning stream so the upstream model knows thinking existed.
+      if (reasoningReplay === ReasoningReplayMode.THINK_TAGS) {
+        contentParts.push("[redacted thinking]");
+      } else if (reasoningContent === null) {
+        thinkingParts.push("[redacted thinking]");
+      }
+    } else if (blockType === "tool_use") {
     } else if (blockType === "tool_use") {
       const toolInput = getBlockAttr(block, "input", {});
       toolCalls.push({
@@ -320,6 +341,7 @@ function _convertUserMessageWithInjection(
 function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[] {
   const result: Record<string, unknown>[] = [];
   const textParts: string[] = [];
+  let imageParts: Record<string, unknown>[] = [];
 
   const flushText = (): void => {
     if (textParts.length) {
@@ -328,15 +350,81 @@ function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[]
     }
   };
 
+  const flushImages = (): void => {
+    // OpenAI supports mixed text + image in a single user message via
+    // content part array, but only when there are images. Coerce text-only
+    // messages to string content for compatibility.
+    if (imageParts.length) {
+      flushText();
+      // Pull all previously emitted simple "user" messages back into
+      // content-parts format only when there's exactly one user message
+      // with text content. If we have tool messages between user turns,
+      // we can't merge — emit images separately.
+      const contentParts: Record<string, unknown>[] = [];
+      // Collect any loose text from the last emitted user message
+      for (let i = result.length - 1; i >= 0; i--) {
+        const msg = result[i];
+        if (msg.role === "user" && typeof msg.content === "string") {
+          contentParts.push({ type: "text", text: msg.content });
+          result.splice(i, 1);
+          break;
+        }
+      }
+      contentParts.push(...imageParts);
+      result.push({ role: "user", content: contentParts });
+      imageParts = [];
+    }
+  };
+
   for (const block of content) {
     const blockType = getBlockType(block);
     if (blockType === "text") {
+      // flushImages before accumulating more text (images need to be co-located)
       textParts.push(String(getBlockAttr(block, "text", "") ?? ""));
     } else if (blockType === "image") {
-      throw new OpenAIConversionError(
-        "User message image blocks are not supported for OpenAI chat conversion.",
-      );
+      const source = getBlockAttr(block, "source", {}) as Record<string, unknown>;
+      if (source && typeof source === "object") {
+        const sourceType = String(source.type ?? "");
+        if (sourceType === "base64") {
+          const mediaType = String(source.media_type || source.mime_type || "image/png");
+          const data = String(source.data ?? "");
+          if (data && isImageMimeType(mediaType)) {
+            let url = data;
+            if (!data.startsWith("data:")) {
+              url = `data:${mediaType};base64,${data}`;
+            }
+            imageParts.push({
+              type: "image_url",
+              image_url: mergeImageDetail({ url }, block),
+            });
+          }
+        } else if (sourceType === "url") {
+          const url = String(source.url ?? "");
+          if (url) {
+            imageParts.push({
+              type: "image_url",
+              image_url: mergeImageDetail({ url }, block),
+            });
+          }
+        }
+      }
+    } else if (blockType === "document") {
+      // Anthropic document blocks carry PDFs/other media. OpenAI Chat
+      // has no native "document" content part type. We serialize a text
+      // summary (filename + media type) so the upstream knows about the
+      // document, but the binary data itself is not carried through.
+      const source = getBlockAttr(block, "source", {}) as Record<string, unknown>;
+      const title = String(getBlockAttr(block, "title", "") ?? "");
+      const context = String(getBlockAttr(block, "context", "") ?? "");
+      if (source && typeof source === "object") {
+        const sourceType = String(source.type ?? "");
+        const mediaType = String(source.media_type ?? "");
+        const filename = title || (sourceType === "url" ? String(source.url ?? "") : "document");
+        const desc = mediaType ? `${filename} (${mediaType})` : filename;
+        textParts.push(context ? `[Document: ${desc}]\n${context}` : `[Document: ${desc}]`);
+      }
     } else if (isToolResultBlockType(blockType)) {
+      flushImages();
       flushText();
       const toolContent = getBlockAttr(block, "content", "");
       const serialized = serializeToolResultContent(toolContent);
@@ -348,8 +436,22 @@ function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[]
     }
   }
 
+  flushImages();
   flushText();
   return result;
+}
+
+function isImageMimeType(mime: string): boolean {
+  return mime.toLowerCase().startsWith("image/");
+}
+
+function mergeImageDetail(
+  imageUrl: Record<string, unknown>,
+  block: ContentBlock,
+): Record<string, unknown> {
+  const detail = getBlockAttr(block, "detail", null);
+  if (detail) (imageUrl as Record<string, unknown>).detail = detail;
+  return imageUrl;
 }
 
 export class AnthropicToOpenAIConverter {
@@ -477,6 +579,13 @@ export class AnthropicToOpenAIConverter {
       return toolChoice;
     }
     return toolChoice;
+  }
+
+  /** Check if the Anthropic `tool_choice` has `disable_parallel_tool_use: true`. */
+  static hasDisableParallelToolUse(toolChoice: unknown): boolean {
+    if (typeof toolChoice !== "object" || toolChoice === null) return false;
+    const tc = toolChoice as Record<string, unknown>;
+    return tc.disable_parallel_tool_use === true;
   }
 
   static convertSystemPrompt(
@@ -619,6 +728,9 @@ export function buildBaseRequestBody(
   const toolChoice = requestData.tool_choice;
   if (toolChoice) {
     body.tool_choice = AnthropicToOpenAIConverter.convertToolChoice(toolChoice);
+    if (AnthropicToOpenAIConverter.hasDisableParallelToolUse(toolChoice)) {
+      body.parallel_tool_calls = false;
+    }
   }
 
   return body;

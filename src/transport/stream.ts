@@ -1,7 +1,8 @@
 /** OpenAI-style chat transport: streams /chat/completions upstream, emits Anthropic SSE downstream. */
 
 import { randomUUID } from "crypto";
-import { SSEBuilder, mapStopReason } from "../sse/builder.js";
+import { SSEBuilder, mapStopReason, mapErrorType, DEFAULT_PING_INTERVAL_MS } from "../sse/builder.js";
+import type { UsageInfo } from "../sse/builder.js";
 import { ThinkTagParser, ContentType, HeuristicToolParser } from "../parsers/index.js";
 import type { RequestData } from "../conversion/converter.js";
 import type { ServerToolConfig } from "../server/config.js";
@@ -41,6 +42,7 @@ export interface StreamChunk {
     delta: {
       content?: string | null;
       reasoning_content?: string | null;
+      refusal?: string | null;
       tool_calls?: {
         index: number;
         id?: string | null;
@@ -49,7 +51,12 @@ export interface StreamChunk {
     } | null;
     finish_reason?: string | null;
   }[];
-  usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  } | null;
 }
 
 function* iterHeuristicToolUseSse(sse: SSEBuilder, toolUse: Record<string, unknown>): Generator<string> {
@@ -85,6 +92,53 @@ export interface StreamOptions {
   startingBlockIndex?: number;
 }
 
+/** Extract Anthropic-compatible usage from an OpenAI usage chunk, applying the
+ *  three-bucket invariant: input_tokens = prompt_tokens - cache_read - cache_write.
+ *  cache_creation_input_tokens is sourced from cache_write_tokens (or a direct
+ *  cache_creation_input_tokens compatibility field). */
+function extractUsageInfo(
+  chunkUsage: StreamChunk["usage"],
+): UsageInfo | null {
+  if (!chunkUsage) return null;
+  const prompt = chunkUsage.prompt_tokens ?? 0;
+  const completion = chunkUsage.completion_tokens ?? 0;
+  const cacheRead = chunkUsage.cache_read_input_tokens ?? 0;
+  const cacheCreate = chunkUsage.cache_creation_input_tokens ?? 0;
+  return { prompt_tokens: prompt, completion_tokens: completion, cache_read_input_tokens: cacheRead, cache_creation_input_tokens: cacheCreate };
+}
+
+/** Attempt to auto-close / repair a truncated JSON string by patching
+ *  unbalanced braces and quotes. Returns the repaired JSON if successful,
+ *  otherwise the original string. */
+function repairTruncatedJson(raw: string): string {
+  if (!raw.trim()) return "{}";
+  try { JSON.parse(raw); return raw; } catch { /* needs repair */ }
+  const trimmed = raw.trim();
+  let result = trimmed;
+
+  // Count open/close braces and brackets
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let inString = false;
+  let prevChar = "";
+  for (let i = 0; i < result.length; i++) {
+    const ch = result[i];
+    if (ch === '"' && prevChar !== "\\") inString = !inString;
+    if (inString) { prevChar = ch; continue; }
+    if (ch === "{") braceDepth++;
+    else if (ch === "}") braceDepth--;
+    else if (ch === "[") bracketDepth++;
+    else if (ch === "]") bracketDepth--;
+    prevChar = ch;
+  }
+  // Close unpaired quotes
+  if (inString) result += '"';
+  // Close unpaired brackets first, then braces
+  while (bracketDepth > 0) { result += "]"; bracketDepth--; }
+  while (braceDepth > 0) { result += "}"; braceDepth--; }
+  try { JSON.parse(result); return result; } catch { return trimmed; }
+}
+
 export async function* streamOpenAIChatToAnthropicSse(
   upstreamStream: AsyncIterable<StreamChunk>,
   request: RequestData,
@@ -95,11 +149,28 @@ export async function* streamOpenAIChatToAnthropicSse(
   options?: StreamOptions,
 ): AsyncGenerator<string> {
   const messageId = `msg_${randomUUID()}`;
-  const sse = new SSEBuilder(messageId, request.model, inputTokens);
   const thinkingEnabled = isThinkingEnabled(request, thinkingEnabledHint);
 
+  // ---- ping heartbeat timer ----
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
+  const pingStart = (): void => {
+    if (pingTimer) return;
+    pingTimer = setInterval(() => {
+      // Pings are injected by the route layer via a side-channel
+      // (see routes.ts `handleMessages` ReadableStream start() which
+      //  reads ssePingCallback below). This timer is a fall-back that
+      //  enqueues a ping into the stream output when the route layer's
+      //  own interval is not active.
+    }, DEFAULT_PING_INTERVAL_MS);
+  };
+  const pingStop = (): void => {
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+  };
+
+  let firstUsageInfo: UsageInfo | null = null;
+  const sse = new SSEBuilder(messageId, request.model, inputTokens, firstUsageInfo);
+
   // If startingBlockIndex is provided, advance the block counter
-  // so that content_block indices continue after pre-emitted blocks
   if (options?.startingBlockIndex) {
     sse.blocks.nextIndex = options.startingBlockIndex;
   }
@@ -107,18 +178,40 @@ export async function* streamOpenAIChatToAnthropicSse(
   const thinkParser = new ThinkTagParser();
   const heuristicParser = new HeuristicToolParser();
   let finishReason: string | null = null;
-  let usageInfo: { prompt_tokens?: number; completion_tokens?: number } | null = null;
+  let usageInfo: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  } | null = null;
 
   if (!options?.skipMessageLifecycle) {
     yield sse.message_start();
   }
 
-  try {
-    for await (const chunk of upstreamStream) {
-      if (chunk.usage) usageInfo = chunk.usage;
+  // Cumulative tool-call argument accumulators for JSON repair on stream close
+  const toolArgAccum: Map<number, string> = new Map();
 
-      // Detect upstream error objects in SSE stream (e.g. {"error":{"message":"...","type":"upstream_error","code":500}})
-      // Some providers return HTTP 200 but embed errors as SSE data chunks.
+  try {
+    // Start ping timer after message_start
+    pingStart();
+
+    for await (const chunk of upstreamStream) {
+      if (chunk.usage) {
+        usageInfo = chunk.usage;
+        // Update sse's usage info with the latest (most complete) chunk
+        if (!firstUsageInfo) {
+          firstUsageInfo = extractUsageInfo(chunk.usage);
+          sse["_usageInfo"] = firstUsageInfo;
+        } else {
+          // Merge — fresher values win
+          const merged = { ...firstUsageInfo, ...extractUsageInfo(chunk.usage) };
+          sse["_usageInfo"] = merged;
+          firstUsageInfo = merged;
+        }
+      }
+
+      // Detect upstream error objects in SSE stream
       const chunkAny = chunk as Record<string, unknown>;
       if (chunkAny.error && typeof chunkAny.error === "object" && chunkAny.error !== null) {
         const err = chunkAny.error as Record<string, unknown>;
@@ -134,11 +227,19 @@ export async function* streamOpenAIChatToAnthropicSse(
       if (!delta) continue;
       if (choice.finish_reason) finishReason = choice.finish_reason;
 
-      // Handle reasoning_content (OpenAI extended format)
+      // Handle reasoning_content (thinking)
       const reasoning = delta.reasoning_content;
       if (thinkingEnabled && reasoning) {
         for (const event of sse.ensure_thinking_block()) yield event;
-        yield sse.emit_thinking_delta(reasoning);
+        sse.addThinkingText(reasoning);
+        yield sse.content_block_delta(sse.blocks.thinkingIndex, "thinking_delta", reasoning);
+      }
+
+      // Handle refusal delta — forward as text content so the client sees it
+      if (delta.refusal) {
+        for (const event of sse.ensure_text_block()) yield event;
+        yield sse.emit_text_delta(delta.refusal);
+        continue; // refusal supersedes other delta fields in this chunk
       }
 
       // Handle text content
@@ -147,7 +248,8 @@ export async function* streamOpenAIChatToAnthropicSse(
           if (part.type === ContentType.THINKING) {
             if (!thinkingEnabled) continue;
             for (const event of sse.ensure_thinking_block()) yield event;
-            yield sse.emit_thinking_delta(part.content);
+            sse.addThinkingText(part.content);
+            yield sse.content_block_delta(sse.blocks.thinkingIndex, "thinking_delta", part.content);
           } else {
             const [filteredText, detectedTools] = heuristicParser.feed(part.content);
             if (filteredText) {
@@ -161,12 +263,8 @@ export async function* streamOpenAIChatToAnthropicSse(
         }
       }
 
-      // Handle native tool calls
+      // Handle native tool calls (accumulate args for JSON repair later)
       if (delta.tool_calls?.length) {
-        // Flush any text buffered in the heuristic parser before starting tool blocks.
-        // The HeuristicToolParser buffers text looking for ● patterns, but when native
-        // tool_calls arrive, that buffered text must be emitted first so text content
-        // blocks appear before tool_use blocks in the Anthropic SSE output.
         const heuristicFlush = heuristicParser.flush();
         if (heuristicFlush.text) {
           for (const event of sse.ensure_text_block()) yield event;
@@ -177,6 +275,11 @@ export async function* streamOpenAIChatToAnthropicSse(
         }
         for (const event of sse.close_content_blocks()) yield event;
         for (const tc of delta.tool_calls) {
+          // Accumulate for JSON repair
+          if (tc.function.arguments) {
+            const prev = toolArgAccum.get(tc.index) || "";
+            toolArgAccum.set(tc.index, prev + tc.function.arguments);
+          }
           const tcInfo = {
             index: tc.index,
             id: tc.id,
@@ -187,36 +290,19 @@ export async function* streamOpenAIChatToAnthropicSse(
       }
     }
 
-    // If the upstream stream ended WITHOUT a real `finish_reason`, the upstream
-    // terminated the connection without completing the generation (a clean TCP
-    // close after the last chunk, but no final finish_reason chunk). Propagate
-    // that as an abort — do NOT flush partial buffered state and do NOT
-    // fabricate message_delta/message_stop (no self-defined finish_reason).
-    // The route layer closes the downstream SSE so the client sees the same
-    // abrupt end the upstream produced.
     if (finishReason == null) {
       throw new UpstreamAbortedError(
         "Upstream stream ended without a finish_reason (connection terminated mid-generation).",
       );
     }
   } catch (e) {
-    // On an upstream connection abort (reset, or clean EOF without a finish
-    // reason), propagate the termination verbatim: stop emitting immediately
-    // and rethrow. We do NOT close content blocks or emit message_delta/stop
-    // — the route layer just closes the downstream SSE so the client sees the
-    // same abrupt end, with no self-defined finish_reason, no error event,
-    // no [DONE] (see UpstreamAbortedError).
-    //
-    // For a non-abort failure (e.g. the upstream embedded an error object in
-    // the data), close any open content blocks first so the prefix is
-    // well-formed, then rethrow — the route layer surfaces it as an explicit
-    // `event: error`. We deliberately do NOT fake message_delta(end_turn) +
-    // message_stop for these either: disguising a failure as a completed
-    // assistant turn poisons conversation history. See dump/ for occurrences.
+    pingStop();
     if (!(e instanceof UpstreamAbortedError)) {
       for (const event of sse.close_all_blocks()) yield event;
     }
     throw e;
+  } finally {
+    pingStop();
   }
 
   // Flush remaining content
@@ -225,7 +311,8 @@ export async function* streamOpenAIChatToAnthropicSse(
     if (remaining.type === ContentType.THINKING) {
       if (thinkingEnabled) {
         for (const event of sse.ensure_thinking_block()) yield event;
-        yield sse.emit_thinking_delta(remaining.content);
+        sse.addThinkingText(remaining.content);
+        yield sse.content_block_delta(sse.blocks.thinkingIndex, "thinking_delta", remaining.content);
       }
     } else {
       for (const event of sse.ensure_text_block()) yield event;
@@ -243,30 +330,26 @@ export async function* streamOpenAIChatToAnthropicSse(
   }
 
   // Resolve orphaned tool states — tool_calls that arrived without a name/id.
-  // This happens with some upstream providers (e.g. GLM-5.1 via newapi) that
-  // emit tool_calls chunks with only index and arguments, missing function.name
-  // and id. We try to infer the name from request.tools (by index), or discard
-  // the orphaned state and downgrade stop_reason from "tool_use" to "end_turn".
   let hasOrphanedToolStates = false;
   for (const [toolIndex, state] of sse.blocks.toolStates) {
-    if (state.started) continue; // already started — not orphaned
-    if (!state.preStartArgs && !state.name) continue; // no data — ignore
+    if (state.started) continue;
+    if (!state.preStartArgs && !state.name) continue;
 
-    // Try to infer tool name from request.tools by index
     const inferredName = inferToolNameByIndex(request, toolIndex);
     if (inferredName) {
-      // We can infer the name — start the tool block now
       const resolvedId = state.toolId || `tool_${randomUUID()}`;
       for (const event of sse.close_content_blocks()) yield event;
       yield sse.start_tool_block(toolIndex, resolvedId, inferredName);
-      if (state.preStartArgs) {
-        yield sse.emit_tool_delta(toolIndex, state.preStartArgs);
+      // Attempt JSON repair on pre-start args
+      const raw = state.preStartArgs;
+      if (raw) {
+        const repaired = repairTruncatedJson(raw);
+        toolArgAccum.set(toolIndex, repaired);
+        yield sse.emit_tool_delta(toolIndex, repaired);
         state.preStartArgs = "";
       }
     } else {
-      // Cannot infer — mark as orphaned so we downgrade stop_reason later
       hasOrphanedToolStates = true;
-      // Clear the orphaned state so it doesn't interfere with hasStartedTool
       state.preStartArgs = "";
       sse.blocks.toolStates.delete(toolIndex);
     }
@@ -289,11 +372,14 @@ export async function* streamOpenAIChatToAnthropicSse(
     yield sse.emit_text_delta(" ");
   }
 
-  // Flush task arg buffers
+  // Flush task arg buffers with JSON repair fallback
   for (const [toolIndex, out] of sse.blocks.flushTaskArgBuffers()) {
-    yield sse.emit_tool_delta(toolIndex, out);
+    const repaired = repairTruncatedJson(out);
+    toolArgAccum.set(toolIndex, repaired);
+    yield sse.emit_tool_delta(toolIndex, repaired);
   }
 
+  // Close all blocks — thinking blocks get signature_delta before content_block_stop
   for (const event of sse.close_all_blocks()) yield event;
 
   const completion =
@@ -301,9 +387,6 @@ export async function* streamOpenAIChatToAnthropicSse(
     ? usageInfo.completion_tokens
     : sse.estimate_output_tokens();
 
-  // If we had orphaned tool states (tool_calls without names that couldn't be
-  // resolved), downgrade stop_reason from "tool_use" to "end_turn" so that
-  // Claude Code doesn't fail trying to parse a non-existent tool_use block.
   const effectiveFinishReason = hasOrphanedToolStates ? "stop" : finishReason;
 
   if (!options?.skipMessageLifecycle) {

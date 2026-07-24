@@ -149,7 +149,7 @@ describe("AnthropicToOpenAIConverter", () => {
       expect(hasExplanation).toBe(true);
     });
 
-    it("skips redacted_thinking blocks", () => {
+    it("replays redacted_thinking as placeholder text for multi-turn reasoning chain", () => {
       const messages: AnthropicMessage[] = [
         {
           role: "assistant",
@@ -160,17 +160,22 @@ describe("AnthropicToOpenAIConverter", () => {
         },
       ];
       const result = AnthropicToOpenAIConverter.convertMessages(messages, ReasoningReplayMode.THINK_TAGS);
-      expect(result).toEqual([{ role: "assistant", content: "Response." }]);
+      expect(result).toEqual([{ role: "assistant", content: "[redacted thinking]\n\nResponse." }]);
     });
 
-    it("throws for image blocks in user message", () => {
+    it("converts user image blocks to image_url format", () => {
       const messages: AnthropicMessage[] = [
         {
           role: "user",
-          content: [{ type: "image", source: { type: "base64" } }],
+          content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "YWJj" } }],
         },
       ];
-      expect(() => AnthropicToOpenAIConverter.convertMessages(messages)).toThrow(OpenAIConversionError);
+      const result = AnthropicToOpenAIConverter.convertMessages(messages);
+      expect(result.length).toBe(1);
+      expect(result[0].role).toBe("user");
+      const content = result[0].content as Record<string, unknown>[];
+      expect(content[0].type).toBe("image_url");
+      expect(content[0].image_url).toEqual({ url: "data:image/png;base64,YWJj" });
     });
 
     it("handles server_tool_use blocks by skipping them (proxy-side only)", () => {

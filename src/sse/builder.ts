@@ -8,16 +8,30 @@ export const ANTHROPIC_SSE_RESPONSE_HEADERS: Record<string, string> = {
   Connection: "keep-alive",
 };
 
+/** Default interval between `event: ping` heartbeat events (ms). */
+export const DEFAULT_PING_INTERVAL_MS = 15_000;
+
 const STOP_REASON_MAP: Record<string, string> = {
   stop: "end_turn",
   length: "max_tokens",
   tool_calls: "tool_use",
-  content_filter: "end_turn",
+  content_filter: "refusal",
 };
 
 export function mapStopReason(openaiReason: string | null | undefined): string {
   if (!openaiReason) return "end_turn";
   return STOP_REASON_MAP[openaiReason] ?? "end_turn";
+}
+
+/** Mapping from upstream OpenAI error fields (or HTTP status ranges)
+ *  to Anthropic SSE `error.error.type` values. */
+export function mapErrorType(
+  openaiCode: number | string | null | undefined,
+): string {
+  const code = typeof openaiCode === "number" ? openaiCode : Number(openaiCode);
+  if (code === 429 || code === 529) return "overloaded_error";
+  if (code >= 400 && code < 500) return "invalid_request_error";
+  return "api_error";
 }
 
 function safeUsageInt(value: unknown): number {
@@ -26,6 +40,13 @@ function safeUsageInt(value: unknown): number {
 
 export function formatSseEvent(eventType: string, data: Record<string, unknown>): string {
   return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+export interface UsageInfo {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
 }
 
 export class ToolCallState {
@@ -141,16 +162,60 @@ export class SSEBuilder {
   blocks: ContentBlockManager;
   private _accumulatedTextParts: string[] = [];
   private _accumulatedReasoningParts: string[] = [];
+  private _usageInfo: UsageInfo | null = null;
+  /** Per-request secret for signing thinking content — derived from message_id
+   *  so signatures are deterministic for the same thinking text within a turn,
+   *  but opaque to the client. */
+  private _thinkingSigningSecret: string;
+  /** Accumulated raw thinking text for generating the signature at block close. */
+  private _thinkingAccum: string = "";
 
-  constructor(messageId: string, model: string, inputTokens = 0) {
+  constructor(messageId: string, model: string, inputTokens = 0, usage?: UsageInfo | null) {
     this.message_id = messageId;
     this.model = model;
     this.input_tokens = inputTokens;
     this.blocks = new ContentBlockManager();
+    this._usageInfo = usage ?? null;
+    this._thinkingSigningSecret = createHash("sha256")
+      .update(`ts-proxy-think-sign:${messageId}`)
+      .digest("hex");
+  }
+
+  /** Compute the thinking signature from accumulated thinking text + per-request
+   *  secret. The output is a hex string that round-trips across turns: the same
+   *  thinking text on the same message_id produces the same signature, so when
+   *  the client replays the block with its signature in a subsequent request,
+   *  the proxy can detect tampering and issue a new signature for the next turn. */
+  private computeThinkingSignature(): string {
+    return createHash("sha256")
+      .update(this._thinkingSigningSecret)
+      .update(this._thinkingAccum)
+      .digest("hex");
+  }
+
+  /** Feed accumulated reasoning text for signature computation. */
+  addThinkingText(text: string): void {
+    this._thinkingAccum += text;
+    this._accumulatedReasoningParts.push(text);
   }
 
   message_start(): string {
     const safeInput = safeUsageInt(this.input_tokens);
+    const usage: Record<string, number> = {
+      input_tokens: this._usageInfo?.prompt_tokens
+        ? (// Recompute clean input_tokens: prompt_tokens minus cache tokens
+          this._usageInfo.prompt_tokens -
+          (this._usageInfo.cache_read_input_tokens ?? 0) -
+          (this._usageInfo.cache_creation_input_tokens ?? 0))
+        : safeInput,
+      output_tokens: 1,
+    };
+    if (this._usageInfo?.cache_read_input_tokens && this._usageInfo.cache_read_input_tokens > 0) {
+      usage.cache_read_input_tokens = this._usageInfo.cache_read_input_tokens;
+    }
+    if (this._usageInfo?.cache_creation_input_tokens && this._usageInfo.cache_creation_input_tokens > 0) {
+      usage.cache_creation_input_tokens = this._usageInfo.cache_creation_input_tokens;
+    }
     return formatSseEvent("message_start", {
       type: "message_start",
       message: {
@@ -161,7 +226,7 @@ export class SSEBuilder {
         model: this.model,
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: safeInput, output_tokens: 1 },
+        usage,
       },
     });
   }
@@ -169,10 +234,20 @@ export class SSEBuilder {
   message_delta(stopReason: string, outputTokens: number | null): string {
     const safeIn = safeUsageInt(this.input_tokens);
     const safeOut = typeof outputTokens === "number" && Number.isFinite(outputTokens) ? outputTokens : 0;
+    const usage: Record<string, number> = {
+      input_tokens: safeIn,
+      output_tokens: safeOut,
+    };
+    if (this._usageInfo?.cache_read_input_tokens && this._usageInfo.cache_read_input_tokens > 0) {
+      usage.cache_read_input_tokens = this._usageInfo.cache_read_input_tokens;
+    }
+    if (this._usageInfo?.cache_creation_input_tokens && this._usageInfo.cache_creation_input_tokens > 0) {
+      usage.cache_creation_input_tokens = this._usageInfo.cache_creation_input_tokens;
+    }
     return formatSseEvent("message_delta", {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { input_tokens: safeIn, output_tokens: safeOut },
+      usage,
     });
   }
 
@@ -218,6 +293,8 @@ export class SSEBuilder {
     const delta: Record<string, unknown> = { type: deltaType };
     if (deltaType === "thinking_delta") {
       delta.thinking = content;
+    } else if (deltaType === "signature_delta") {
+      delta.signature = content;
     } else if (deltaType === "text_delta") {
       delta.text = content;
     } else if (deltaType === "input_json_delta") {
@@ -230,6 +307,11 @@ export class SSEBuilder {
     });
   }
 
+  /** Emit an SSE ping heartbeat event (Anthropic keep-alive). */
+  ping(): string {
+    return "event: ping\ndata: {}\n\n";
+  }
+
   content_block_stop(index: number): string {
     return formatSseEvent("content_block_stop", {
       type: "content_block_stop",
@@ -240,17 +322,35 @@ export class SSEBuilder {
   start_thinking_block(): string {
     this.blocks.thinkingIndex = this.blocks.allocateIndex();
     this.blocks.thinkingStarted = true;
-    return this.content_block_start(this.blocks.thinkingIndex, "thinking");
+    this._thinkingAccum = "";
+    return this.content_block_start(this.blocks.thinkingIndex, "thinking", { thinking: "" });
   }
 
   emit_thinking_delta(content: string): string {
+    this._thinkingAccum += content;
     this._accumulatedReasoningParts.push(content);
     return this.content_block_delta(this.blocks.thinkingIndex, "thinking_delta", content);
+  }
+
+  /** Emit a `signature_delta` carrying the HMAC-SHA256 of the accumulated
+   *  thinking text. Called immediately before `stop_thinking_block()` to produce
+   *  the `content_block_delta(signature_delta)` + `content_block_stop` sequence
+   *  that Claude Code expects for multi-turn thinking verification. */
+  emit_signature_delta(): string {
+    const sig = this.computeThinkingSignature();
+    return this.content_block_delta(this.blocks.thinkingIndex, "signature_delta", sig);
   }
 
   stop_thinking_block(): string {
     this.blocks.thinkingStarted = false;
     return this.content_block_stop(this.blocks.thinkingIndex);
+  }
+
+  /** Close a thinking block with its signature delta, as one atomic sequence.
+   *  Yields: signature_delta + content_block_stop */
+  *close_thinking_with_signature(): Generator<string> {
+    yield this.emit_signature_delta();
+    yield this.stop_thinking_block();
   }
 
   start_text_block(): string {
@@ -309,7 +409,10 @@ export class SSEBuilder {
   }
 
   *close_content_blocks(): Generator<string> {
-    if (this.blocks.thinkingStarted) yield this.stop_thinking_block();
+    if (this.blocks.thinkingStarted) {
+      yield this.emit_signature_delta();
+      yield this.stop_thinking_block();
+    }
     if (this.blocks.textStarted) yield this.stop_text_block();
   }
 
@@ -365,10 +468,13 @@ export class SSEBuilder {
     yield this.content_block_stop(index);
   }
 
-  emit_top_level_error(errorMessage: string): string {
+  emit_top_level_error(errorMessage: string, errorType?: string): string {
     return formatSseEvent("error", {
       type: "error",
-      error: { type: "api_error", message: errorMessage },
+      error: {
+        type: errorType || "api_error",
+        message: errorMessage,
+      },
     });
   }
 

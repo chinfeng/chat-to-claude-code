@@ -15,7 +15,7 @@ describe("mapStopReason", () => {
     expect(mapStopReason("stop")).toBe("end_turn");
     expect(mapStopReason("length")).toBe("max_tokens");
     expect(mapStopReason("tool_calls")).toBe("tool_use");
-    expect(mapStopReason("content_filter")).toBe("end_turn");
+    expect(mapStopReason("content_filter")).toBe("refusal");
   });
 
   it("defaults to end_turn for unknown reasons", () => {

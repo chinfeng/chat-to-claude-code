@@ -9,7 +9,7 @@ import { estimateInputTokens } from "../core/tokens.js";
 import { invalidRequestError, authenticationError, upstreamError, serverError } from "../core/errors.js";
 import type { ServerConfig, ServerToolConfig } from "./config.js";
 import { resolveModelExtra, deepMerge } from "./config.js";
-import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder } from "../sse/builder.js";
+import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder, mapErrorType, DEFAULT_PING_INTERVAL_MS } from "../sse/builder.js";
 import { createDumpSession, type DumpTermination, type TerminationReason, type ServerToolLogEntry } from "../core/dump.js";
 import {
   isServerToolType,
@@ -583,7 +583,9 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
                 // no finish_reason, no [DONE] — just the SSE close in `finally`,
                 // so the downstream client sees the same abrupt end.
                 const msg = e instanceof Error ? e.message : String(e);
-                const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
+                const code = (e instanceof Error && "code" in e) ? (e as { code?: number }).code : undefined;
+                const errType = mapErrorType(code);
+                const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: errType, message: msg } })}\n\n`;
                 downstreamChunks.push(errLine);
                 try { controller.enqueue(encoder.encode(errLine)); } catch { /* stream already closed */ }
               }
@@ -1084,7 +1086,9 @@ async function handleServerToolRequest(
                     // — propagates verbatim: no error event, no finish_reason,
                     // no [DONE], just the SSE close in `finally`.
                     const msg = e instanceof Error ? e.message : String(e);
-                    const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: msg } })}\n\n`;
+                    const code = (e instanceof Error && "code" in e) ? (e as { code?: number }).code : undefined;
+                    const errType = mapErrorType(code);
+                    const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: errType, message: msg } })}\n\n`;
                     try { emit(errLine); } catch { /* stream closed */ }
                 }
                 dump.writeDownstreamResponse({

@@ -359,7 +359,10 @@ Unmatched paths return `404` with an Anthropic-format error body.
 | `tool_use` block | `tool_calls[i]` | Tool call arguments JSON-serialized |
 | `tool_result` block | `{"role": "tool", "tool_call_id": "..."}` | Tool result serialized as tool message |
 | `thinking` block | thinking tag embedded in content | Controlled by `ReasoningReplayMode` |
-| `redacted_thinking` block | Dropped | Not forwarded upstream |
+| `redacted_thinking` block | Replayed as `[redacted thinking]` placeholder | Preserves multi-turn reasoning chain |
+| `thinking` block (signature) | Preserved as `<!--sig:...-->` prefix in thinking tags | Round-trip signature preservation for multi-turn verification |
+| `document` block | Serialized as `[Document: filename (media_type)]` text | PDF/document awareness (binary not forwarded) |
+| `image` block (base64/url) | `image_url` content part | Anthropic image blocks converted to OpenAI format |
 
 ### Streaming SSE Event Mapping
 
@@ -368,10 +371,18 @@ Unmatched paths return `404` with an Anthropic-format error body.
 | `delta.reasoning_content` | `content_block_start(thinking)` + `content_block_delta(thinking_delta)` |
 | `delta.content` (contains thinking tag) | Parsed and dispatched as thinking / text delta |
 | `delta.content` (plain text) | `content_block_delta(text_delta)` |
+| `delta.refusal` | `content_block_delta(text_delta)` — refusal forwarded as visible text |
 | `delta.tool_calls` | `content_block_start(tool_use)` + `content_block_delta(input_json_delta)` |
 | `delta.content` (WebSearch/WebFetch text) | `content_block_start(server_tool_use)` + `content_block_start(web_search_tool_result)` |
 | `finish_reason: "stop"` | `message_delta(stop_reason: "end_turn")` |
 | `finish_reason: "tool_calls"` | `message_delta(stop_reason: "tool_use")` |
+| thinking block close | `content_block_delta(signature_delta)` + `content_block_stop` |
+| `usage.prompt_tokens_details.cached_tokens` | `message_start.usage.cache_read_input_tokens` |
+| `usage.prompt_tokens_details.cache_write_tokens` | `message_start.usage.cache_creation_input_tokens` |
+| `event: ping` (heartbeat) | Injected every 15s during long streams |
+| in-stream error object | `event: error` with mapped error type (`overloaded_error` / `invalid_request_error` / `api_error`) |
+| `tool_choice.disable_parallel_tool_use: true` | `parallel_tool_calls: false` at request body root |
+| truncated tool_use input JSON | Auto-repaired via brace-balancing before `content_block_stop` |
 
 ### Stop Reason Mapping
 
@@ -380,7 +391,7 @@ Unmatched paths return `404` with an Anthropic-format error body.
 | `stop` | `end_turn` |
 | `length` | `max_tokens` |
 | `tool_calls` | `tool_use` |
-| `content_filter` | `end_turn` |
+| `content_filter` | `refusal` |
 | other | `end_turn` |
 
 ### Heuristic Tool Call Parsing
