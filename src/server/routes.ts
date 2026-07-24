@@ -118,11 +118,20 @@ function buildUpstreamRequest(requestData: RequestData, apiKey: string, config: 
   return { request, requestBody, requestHeaders: headers };
 }
 
-/** Parse an SSE line from the upstream into a JSON object. */
+/** Parse an SSE line from the upstream into a JSON object.
+ *
+ *  `data: [DONE]` is the OpenAI stream-end marker. Some providers emit `[DONE]`
+ *  without a preceding `finish_reason` chunk; for those it is the ONLY completion
+ *  signal. We surface it to the caller as a sentinel (`{ __sseDone: true }`)
+ *  rather than silently dropping it, so stream.ts can treat a `[DONE]`-only end
+ *  as graceful completion (message_delta + message_stop) instead of a connection
+ *  abort — matching cc-switch. Consumers that only care about real choices
+ *  (e.g. collectToolCallArguments) skip it harmlessly via `!chunk.choices?.length`.
+ */
 function parseSseLine(line: string): unknown | null {
   if (!line.startsWith("data: ")) return null;
   const data = line.slice(6).trim();
-  if (data === "[DONE]") return null;
+  if (data === "[DONE]") return { __sseDone: true };
   try {
     return JSON.parse(data);
   } catch {
@@ -148,10 +157,10 @@ async function* iterUpstreamChunks(
         ({ done, value } = await reader.read());
       } catch (e) {
         // Upstream connection dropped mid-stream (reset/abort). Propagate as
-        // UpstreamAbortedError so the route layer closes the downstream SSE
-        // without fabricating a terminal marker (no error event / self-defined
-        // finish_reason / [DONE]) — the abort propagates to the downstream
-        // client verbatim as an abrupt stream end.
+        // UpstreamAbortedError (no code → api_error) so the route layer emits an
+        // explicit, retryable `event: error` after closing any open content
+        // blocks — never an abrupt close, which claude-code reports as "empty
+        // or malformed response (HTTP 200)" and does not retry.
         const msg = e instanceof Error ? e.message : String(e);
         throw new UpstreamAbortedError(`Upstream stream read error: ${msg}`);
       }
@@ -575,20 +584,28 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
           } catch (e) {
             if (!downstreamAborted) {
               terminationReason = "upstream_abort";
-              if (!(e instanceof UpstreamAbortedError)) {
-                // Non-connection failure (e.g. upstream embedded an error
-                // object, or an unexpected internal error): surface it as an
-                // explicit `event: error`. An upstream connection abort
-                // (UpstreamAbortedError) propagates verbatim — no error event,
-                // no finish_reason, no [DONE] — just the SSE close in `finally`,
-                // so the downstream client sees the same abrupt end.
-                const msg = e instanceof Error ? e.message : String(e);
-                const code = (e instanceof Error && "code" in e) ? (e as { code?: number }).code : undefined;
-                const errType = mapErrorType(code);
-                const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: errType, message: msg } })}\n\n`;
-                downstreamChunks.push(errLine);
-                try { controller.enqueue(encoder.encode(errLine)); } catch { /* stream already closed */ }
-              }
+              // Surface the failure as an explicit `event: error` — for BOTH an
+              // upstream-embedded error object (UpstreamStreamError, carries a
+              // code) and a connection abort (UpstreamAbortedError, no code →
+              // api_error). An SSE stream that simply closes mid-message
+              // (message_start emitted, no message_stop) is reported by
+              // claude-code as `API returned an empty or malformed response
+              // (HTTP 200)` and is NOT retried. Emitting a real `event: error`
+              // (a recognized Anthropic SSE error event) lets claude-code
+              // classify it as retryable (api_error/overloaded_error) and retry
+              // the turn — matching cc-switch's read-error handling. The error
+              // is NOT wrapped in a text content block and NO message_stop after
+              // it, so the turn is never persisted as completed: the SDK throws
+              // on the error event and discards the partial message (no
+              // conversation-history poisoning — the original pre-78484ae bug
+              // poisoned history by emitting the error as a text_delta + fake
+              // end_turn + message_stop, none of which we do here).
+              const msg = e instanceof Error ? e.message : String(e);
+              const code = (e instanceof Error && "code" in e) ? (e as { code?: number }).code : undefined;
+              const errType = mapErrorType(code);
+              const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: errType, message: msg } })}\n\n`;
+              downstreamChunks.push(errLine);
+              try { controller.enqueue(encoder.encode(errLine)); } catch { /* stream already closed */ }
             }
           }
         } finally {
@@ -1078,13 +1095,15 @@ async function handleServerToolRequest(
                 });
                 dump.setTiming({ ttfb: Date.now() - requestStartMs, totalTime: Date.now() - requestStartMs });
             } catch (e) {
-                if (!abortSignal?.aborted && !(e instanceof UpstreamAbortedError)) {
-                    // Non-connection failure (e.g. tool execution error, or an
-                    // unexpected error): surface it as `event: error`. An
-                    // upstream connection abort (UpstreamAbortedError) —
-                    // including the final stream ending without a finish_reason
-                    // — propagates verbatim: no error event, no finish_reason,
-                    // no [DONE], just the SSE close in `finally`.
+                if (!abortSignal?.aborted) {
+                    // Surface the failure as `event: error` for every non-client-
+                    // aborted cause — including an upstream connection abort
+                    // (UpstreamAbortedError: socket reset, or the final stream
+                    // ending without a finish_reason) — so claude-code sees a
+                    // retryable error event (api_error) rather than an
+                    // incomplete stream it would report as "empty or malformed
+                    // response (HTTP 200)" and not retry. See the standard flow
+                    // catch for the full rationale.
                     const msg = e instanceof Error ? e.message : String(e);
                     const code = (e instanceof Error && "code" in e) ? (e as { code?: number }).code : undefined;
                     const errType = mapErrorType(code);

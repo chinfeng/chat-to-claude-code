@@ -380,11 +380,13 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 4: upstream connection abort propagates to the downstream client as
-  //         an abrupt stream close (no fabricated terminal marker)
+  // Bug 4: an upstream connection abort surfaces downstream as an explicit
+  //         `event: error` (api_error) so claude-code retries — never an abrupt
+  //         close, which claude-code reports as "empty or malformed response
+  //         (HTTP 200)" and does NOT retry.
   // -----------------------------------------------------------------------
 
-  it("propagates an upstream connection abort as an abrupt SSE close instead of an error event", async () => {
+  it("surfaces an upstream connection abort as an SSE error event so the client retries", async () => {
     const goodPrefix = sseData({
       id: "chatcmpl-err",
       object: "chat.completion.chunk",
@@ -402,26 +404,93 @@ describe("SSE stream forwarding", () => {
     const events = parseSseResponse(body);
     const eventTypes = events.map((e) => e.event);
 
-    // The stream begins: message_start is always emitted up front. Under
-    // enableThinking the prefix content delta is buffered by the ThinkTagParser
-    // and only flushed on normal completion; on abort we propagate the close
-    // instead of fabricating a partial block, so the prefix text is left
-    // unflushed and need not appear.
+    // The stream begins with message_start (always emitted up front).
     expect(eventTypes).toContain("message_start");
 
-    // An upstream connection abort must propagate to the downstream client as
-    // an abrupt stream close — NOT be converted into a downstream terminal
-    // marker. No `event: error`, no message_delta/message_stop (no
-    // self-defined finish_reason), no [DONE]. The original behavior either
-    // emitted `event: error` or faked `end_turn` + `message_stop`, both of
-    // which let the client (e.g. Claude Code) treat the failure as a normal
-    // completed turn and poison conversation history.
-    expect(eventTypes).not.toContain("error");
+    // An upstream connection abort (socket reset / clean EOF with no
+    // finish_reason) must surface as a real top-level `event: error` — NOT be
+    // swallowed as an abrupt close. claude-code treats a stream that closes
+    // mid-message (message_start emitted, no message_stop) as malformed and
+    // reports "API returned an empty or malformed response (HTTP 200)" WITHOUT
+    // retrying; an explicit `event: error` (here api_error, since the abort
+    // carries no code) lets it classify the failure as retryable and retry the
+    // turn. This matches cc-switch's read-error handling.
+    expect(eventTypes).toContain("error");
+    const errorEvents = events.filter((e) => e.event === "error");
+    expect(errorEvents.length).toBeGreaterThan(0);
+    expect(errorEvents.some((e) => e.data.includes('"type":"api_error"'))).toBe(true);
+    expect(errorEvents.some((e) => e.data.includes("Upstream stream read error"))).toBe(true);
+    expect(errorEvents.some((e) => e.data.includes("Connection reset by peer"))).toBe(true);
+
+    // CRITICAL: the error must NOT be disguised as assistant text content. The
+    // original pre-78484ae bug wrapped the error message in a `text` content
+    // block (content_block_start "text" + text_delta) and then signalled
+    // end_turn, making Claude Code treat the failure as a completed turn and
+    // persist the error string into conversation history — poisoning subsequent
+    // turns. Assert the error never appears inside any text_delta.
+    expect(body).not.toMatch(/text_delta[^}]*Upstream stream read error/);
+    expect(body).not.toMatch(/text_delta[^}]*Connection reset by peer/);
+
+    // And the message must NOT be falsely reported as a successful turn. After
+    // the error there must be no message_delta / message_stop / [DONE] — the
+    // client retries the whole turn, it does not persist a failed/partial one.
     expect(eventTypes).not.toContain("message_delta");
     expect(eventTypes).not.toContain("message_stop");
     expect(body).not.toContain("[DONE]");
-    expect(body).not.toContain("Upstream stream read error");
-    expect(body).not.toContain("Connection reset by peer");
+  });
+
+  // -----------------------------------------------------------------------
+  // [DONE]-as-completion (cc-switch parity): some providers emit the OpenAI
+  //         stream-end marker `data: [DONE]` WITHOUT a preceding
+  //         `finish_reason` chunk. That `[DONE]` is the only completion signal
+  //         — it must complete the turn gracefully (message_delta +
+  //         message_stop), NOT be treated as a connection abort. This is the
+  //         counterpart to Bug 4: abort = no finish_reason AND no `[DONE]`
+  //         (→ event:error → retry); [DONE] = no finish_reason BUT `[DONE]`
+  //         present (→ complete normally, no retry).
+  // -----------------------------------------------------------------------
+
+  it("treats [DONE] without finish_reason as graceful completion, not an abort", async () => {
+    // Upstream emits text chunks then `data: [DONE]` with NO finish_reason chunk.
+    const sseBody = [
+      sseData({
+        id: "chatcmpl-done",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+      }),
+      sseData({
+        id: "chatcmpl-done",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta: { content: "hi there" }, finish_reason: null }],
+      }),
+      SSE_DONE,
+    ].join("");
+    mockFetchWithSse(sseBody);
+
+    const res = await routeRequest(makeMessagesRequest(), TEST_CONFIG);
+    expect(res.status).toBe(200);
+
+    const body = await collectResponseBody(res);
+    const events = parseSseResponse(body);
+    const eventTypes = events.map((e) => e.event);
+
+    // Completed normally — full Anthropic message lifecycle, no retry.
+    expect(eventTypes).toContain("message_start");
+    expect(eventTypes).toContain("message_delta");
+    expect(eventTypes).toContain("message_stop");
+
+    // [DONE] is treated as an implicit `stop` → stop_reason "end_turn".
+    const msgDelta = events.find((e) => e.event === "message_delta");
+    expect(msgDelta?.data).toContain('"stop_reason":"end_turn"');
+
+    // NOT surfaced as an upstream abort / error — [DONE] signals completion.
+    expect(eventTypes).not.toContain("error");
+    expect(body).not.toContain("without a finish_reason");
+    expect(body).not.toContain("Upstream stream ended");
   });
 
   // -----------------------------------------------------------------------
@@ -653,11 +722,11 @@ describe("SSE stream forwarding", () => {
       const res = await routeRequest(makeMessagesRequest(), configWithDump);
       expect(res.status).toBe(200);
 
-      // Read the full response — the upstream abort propagates as an abrupt
-      // stream close (no fabricated terminal marker), and finalizeDump must
-      // still run.
+      // Read the full response — the upstream abort surfaces as an explicit
+      // `event: error` (api_error), and finalizeDump must still run.
       const body = await collectResponseBody(res);
-      expect(body).not.toContain("Upstream stream read error");
+      expect(body).toContain("Upstream stream read error");
+      expect(body).toContain('"type":"api_error"');
 
       // Verify dump was finalized: directory renamed with __START_ and __END_
       const { readdirSync } = await import("node:fs");

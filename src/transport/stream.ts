@@ -22,13 +22,23 @@ export class UpstreamStreamError extends Error {
  * Thrown when the upstream CONNECTION terminates mid-stream — either a read
  * error/reset (the upstream socket was closed unexpectedly) or a clean EOF
  * with no `finish_reason` (the upstream closed without completing the
- * generation). Propagated to the route layer, which closes the downstream SSE
- * WITHOUT fabricating a terminal marker: no `event: error`, no
- * message_delta/message_stop (no self-defined finish_reason), no [DONE] — so
- * the abort propagates to the downstream client as an abrupt stream end.
+ * generation). Carries no error code, so the route layer maps it to the
+ * generic retryable `api_error` type.
  *
- * Contrast with UpstreamStreamError (upstream sent an explicit error object
- * while still connected), which still surfaces downstream as `event: error`.
+ * Propagated to the route layer, which first close_all_blocks()'s any open
+ * content blocks (well-formed prefix), then emits a top-level SSE
+ * `event: error` (api_error) — but NO message_delta/message_stop and NO
+ * self-defined finish_reason, so the failure is never disguised as a completed
+ * assistant turn and never poisons conversation history. The explicit
+ * `event: error` lets claude-code classify the failure as retryable and retry
+ * the turn, instead of seeing an incomplete stream ("message_start with no
+ * message_stop") that it reports as "API returned an empty or malformed
+ * response (HTTP 200)" and does NOT retry.
+ *
+ * Same downstream treatment as UpstreamStreamError (upstream sent an explicit
+ * error object while still connected) — which differs only in that it carries a
+ * code, so mapErrorType may yield a more specific error type (e.g.
+ * overloaded_error for 429/529).
  */
 export class UpstreamAbortedError extends Error {
   constructor(message: string) {
@@ -168,6 +178,11 @@ export async function* streamOpenAIChatToAnthropicSse(
   };
 
   let firstUsageInfo: UsageInfo | null = null;
+  // Set when the upstream sent the OpenAI stream-end marker `data: [DONE]` (surfaced
+  // as the `{ __sseDone: true }` sentinel by parseSseLine in routes.ts). When set
+  // we treat a finish-reason-less end as graceful completion (implicit `stop`),
+  // not a connection abort — matches cc-switch's [DONE] handling.
+  let seenDone = false;
   const sse = new SSEBuilder(messageId, request.model, inputTokens, firstUsageInfo);
 
   // If startingBlockIndex is provided, advance the block counter
@@ -197,6 +212,16 @@ export async function* streamOpenAIChatToAnthropicSse(
     pingStart();
 
     for await (const chunk of upstreamStream) {
+      // OpenAI stream-end marker: `[DONE]` is an explicit completion signal even
+      // when no `finish_reason` chunk arrived (some providers emit `[DONE]`
+      // without finish_reason). Treat it as graceful completion (matching
+      // cc-switch), not a connection abort. parseSseLine surfaces it as the
+      // `{ __sseDone: true }` sentinel (see routes.ts); it carries no
+      // choices/usage, so detect+break here before the normal-chunk handling.
+      if ((chunk as Record<string, unknown>).__sseDone) {
+        seenDone = true;
+        break;
+      }
       if (chunk.usage) {
         usageInfo = chunk.usage;
         // Update sse's usage info with the latest (most complete) chunk
@@ -290,16 +315,45 @@ export async function* streamOpenAIChatToAnthropicSse(
       }
     }
 
+    // No finish_reason chunk was seen. Two sub-cases:
+    //  1. [DONE] arrived (seenDone): the upstream signalled completion
+    //     explicitly even without a finish_reason chunk — treat it as an
+    //     implicit `stop` and complete the turn gracefully (message_delta +
+    //     message_stop), so we never turn a completed turn into a spurious
+    //     abort/retry. Matches cc-switch's [DONE] handling.
+    //  2. No [DONE], no finish_reason: the upstream terminated without
+    //     completing (clean TCP close after the last chunk, or — via
+    //     iterUpstreamChunks — a socket reset/abort). This is a connection
+    //     abort: throw UpstreamAbortedError so the route layer emits an
+    //     explicit, retryable `event: error` (api_error) — never a self-defined
+    //     finish_reason/message_stop (that would disguise a failure as a
+    //     completed turn and poison history), and never an abrupt close (which
+    //     claude-code reports as "empty or malformed response (HTTP 200)" and
+    //     does not retry).
     if (finishReason == null) {
-      throw new UpstreamAbortedError(
-        "Upstream stream ended without a finish_reason (connection terminated mid-generation).",
-      );
+      if (seenDone) {
+        finishReason = "stop";
+      } else {
+        throw new UpstreamAbortedError(
+          "Upstream stream ended without a finish_reason (connection terminated mid-generation).",
+        );
+      }
     }
   } catch (e) {
     pingStop();
-    if (!(e instanceof UpstreamAbortedError)) {
-      for (const event of sse.close_all_blocks()) yield event;
-    }
+    // Close any content blocks opened so far so the downstream prefix is
+    // well-formed up to the failure point, then rethrow: the route layer emits a
+    // top-level `event: error` (retryable, e.g. api_error) — for BOTH an
+    // upstream-embedded error object (UpstreamStreamError, carries a code) and
+    // a connection abort (UpstreamAbortedError, no code). We deliberately do NOT
+    // wrap the error in a `text` content block and do NOT emit
+    // message_delta/message_stop: disguising a failure as a completed assistant
+    // turn poisons conversation history, while an abrupt close with no terminal
+    // marker makes claude-code report "empty or malformed response (HTTP 200)"
+    // and never retry. `event: error` is the only signal that both avoids the
+    // malformed-response error and triggers a retry, matching cc-switch's
+    // read-error handling.
+    for (const event of sse.close_all_blocks()) yield event;
     throw e;
   } finally {
     pingStop();
