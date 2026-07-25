@@ -310,4 +310,54 @@ describe("SSEBuilder", () => {
     expect(sse.blocks.textIndex).toBe(2);
     expect(sse.blocks.nextIndex).toBe(3);
   });
+
+  it("message_delta uses the inputTokens estimate when no usage chunk arrived (G4)", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const delta = sse.message_delta("end_turn", 50);
+    const parsed = JSON.parse(delta.split("data: ")[1].trim());
+    expect(parsed.usage.input_tokens).toBe(10); // estimate
+    expect(parsed.usage.output_tokens).toBe(50);
+  });
+
+  it("message_delta reports real input_tokens from usageInfo when present (G4)", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    (sse as unknown as { _usageInfo: unknown })._usageInfo = {
+      prompt_tokens: 100,
+      completion_tokens: 5,
+      cache_read_input_tokens: 30,
+      cache_creation_input_tokens: 10,
+    };
+    const delta = sse.message_delta("end_turn", 5);
+    const parsed = JSON.parse(delta.split("data: ")[1].trim());
+    // input = 100 - 30 (cache_read) - 10 (cache_creation) = 60
+    expect(parsed.usage.input_tokens).toBe(60);
+    expect(parsed.usage.output_tokens).toBe(5);
+    expect(parsed.usage.cache_read_input_tokens).toBe(30);
+    expect(parsed.usage.cache_creation_input_tokens).toBe(10);
+  });
+
+  it("message_delta saturates input_tokens to 0 when cache buckets exceed prompt", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    (sse as unknown as { _usageInfo: unknown })._usageInfo = {
+      prompt_tokens: 10,
+      cache_read_input_tokens: 100,
+    };
+    const delta = sse.message_delta("end_turn", 1);
+    const parsed = JSON.parse(delta.split("data: ")[1].trim());
+    expect(parsed.usage.input_tokens).toBe(0);
+  });
+
+  it("message_start keeps using the estimate until a usage chunk arrives (G4)", () => {
+    const sse = new SSEBuilder("msg_test", "gpt-4o", 10);
+    const start = JSON.parse(sse.message_start().split("data: ")[1].trim());
+    expect(start.message.usage.input_tokens).toBe(10); // no usage yet → estimate
+
+    (sse as unknown as { _usageInfo: unknown })._usageInfo = {
+      prompt_tokens: 50,
+      cache_read_input_tokens: 5,
+    };
+    const startAfter = JSON.parse(sse.message_start().split("data: ")[1].trim());
+    // If a usage chunk IS present at message_start time, real input is used.
+    expect(startAfter.message.usage.input_tokens).toBe(45); // 50 - 5
+  });
 });

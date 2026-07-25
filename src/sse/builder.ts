@@ -199,14 +199,27 @@ export class SSEBuilder {
     this._accumulatedReasoningParts.push(text);
   }
 
+  /** Anthropic `input_tokens` = upstream `prompt_tokens` minus the cache buckets
+   *  that have already been accounted separately (cache_read + cache_write),
+   *  saturated at 0 — the three-bucket invariant cc-switch computes in
+   *  `build_anthropic_usage_json`. When no upstream usage chunk has arrived yet
+   *  (message_start is emitted up front, before any usage), fall back to the
+   *  constructor `input_tokens` estimate. */
+  private computeInputTokens(): number {
+    const u = this._usageInfo;
+    if (u && typeof u.prompt_tokens === "number") {
+      const cached = u.cache_read_input_tokens ?? 0;
+      const cacheCre = u.cache_creation_input_tokens ?? 0;
+      return Math.max(0, u.prompt_tokens - cached - cacheCre);
+    }
+    return safeUsageInt(this.input_tokens);
+  }
+
   message_start(): string {
     const safeInput = safeUsageInt(this.input_tokens);
     const usage: Record<string, number> = {
-      input_tokens: this._usageInfo?.prompt_tokens
-        ? (// Recompute clean input_tokens: prompt_tokens minus cache tokens
-          this._usageInfo.prompt_tokens -
-          (this._usageInfo.cache_read_input_tokens ?? 0) -
-          (this._usageInfo.cache_creation_input_tokens ?? 0))
+      input_tokens: this._usageInfo && typeof this._usageInfo.prompt_tokens === "number"
+        ? this.computeInputTokens()
         : safeInput,
       output_tokens: 1,
     };
@@ -232,7 +245,11 @@ export class SSEBuilder {
   }
 
   message_delta(stopReason: string, outputTokens: number | null): string {
-    const safeIn = safeUsageInt(this.input_tokens);
+    // message_delta is emitted at stream end, after a usage chunk has arrived
+    // (when stream_options.include_usage was requested): report the REAL input
+    // token count (prompt_tokens minus cache buckets) instead of the
+    // constructor estimate. Falls back to the estimate when no usage arrived.
+    const safeIn = this.computeInputTokens();
     const safeOut = typeof outputTokens === "number" && Number.isFinite(outputTokens) ? outputTokens : 0;
     const usage: Record<string, number> = {
       input_tokens: safeIn,

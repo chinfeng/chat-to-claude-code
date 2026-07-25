@@ -64,8 +64,16 @@ export interface StreamChunk {
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
+    /** Anthropic-compat direct cache fields (some upstreams surface these). */
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
+    /** OpenAI-standard usage breakdown. GLM-5.2 / OpenAI expose cache hits here:
+     *  cached_tokens = read from cache, cache_write_tokens = written to cache.
+     *  These are the FALLBACK behind the direct compat fields above. */
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+      cache_write_tokens?: number;
+    } | null;
   } | null;
 }
 
@@ -102,19 +110,38 @@ export interface StreamOptions {
   startingBlockIndex?: number;
 }
 
-/** Extract Anthropic-compatible usage from an OpenAI usage chunk, applying the
- *  three-bucket invariant: input_tokens = prompt_tokens - cache_read - cache_write.
- *  cache_creation_input_tokens is sourced from cache_write_tokens (or a direct
- *  cache_creation_input_tokens compatibility field). */
-function extractUsageInfo(
+/** Extract Anthropic-compatible usage from an OpenAI usage chunk.
+ *
+ *  Cache buckets are read with two-tier fallback (matching cc-switch
+ *  `extract_cache_read_tokens` / `extract_cache_write_tokens`):
+ *
+ *    cache_read       = usage.cache_read_input_tokens        (Anthropic-compat direct)
+ *                     | usage.prompt_tokens_details.cached_tokens   (OpenAI-standard)
+ *    cache_creation   = usage.cache_creation_input_tokens    (Anthropic-compat direct)
+ *                     | usage.prompt_tokens_details.cache_write_tokens (OpenAI-standard)
+ *
+ *  GLM-5.2 via newapi surfaces its cache hits in `prompt_tokens_details`
+ *  (OpenAI-standard form), not in the Anthropic-compat direct fields — so reading
+ *  only the direct fields dropped all cache accounting for the GLM upstream. */
+export function extractUsageInfo(
   chunkUsage: StreamChunk["usage"],
 ): UsageInfo | null {
   if (!chunkUsage) return null;
   const prompt = chunkUsage.prompt_tokens ?? 0;
   const completion = chunkUsage.completion_tokens ?? 0;
-  const cacheRead = chunkUsage.cache_read_input_tokens ?? 0;
-  const cacheCreate = chunkUsage.cache_creation_input_tokens ?? 0;
-  return { prompt_tokens: prompt, completion_tokens: completion, cache_read_input_tokens: cacheRead, cache_creation_input_tokens: cacheCreate };
+  const details = chunkUsage.prompt_tokens_details ?? null;
+  const cacheRead =
+    chunkUsage.cache_read_input_tokens ??
+    (details?.cached_tokens && details.cached_tokens > 0 ? details.cached_tokens : 0);
+  const cacheCreate =
+    chunkUsage.cache_creation_input_tokens ??
+    (details?.cache_write_tokens && details.cache_write_tokens > 0 ? details.cache_write_tokens : 0);
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheCreate,
+  };
 }
 
 /** Attempt to auto-close / repair a truncated JSON string by patching

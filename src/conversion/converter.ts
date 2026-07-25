@@ -1,6 +1,7 @@
 /** Anthropic Messages API → OpenAI Chat Completions API conversion. */
 
 import { isServerToolType, buildServerToolFunctionSchema, buildServerToolSystemPromptSuffix } from "../server/server_tools.js";
+import { canonicalJsonStringify } from "./canonical.js";
 
 export class OpenAIConversionError extends Error {
   constructor(message: string) {
@@ -27,30 +28,100 @@ function toolInputSchema(tool: Record<string, unknown>): Record<string, unknown>
   return { type: "object", properties: {} };
 }
 
-function serializeToolResultContent(toolContent: unknown): string {
-  if (toolContent === null || toolContent === undefined) return "";
-  if (typeof toolContent === "string") return toolContent;
+/** Remove the single line terminator (\r\n | \r | \n) starting at fromIndex. */
+function stripTrailingNewline(text: string, fromIndex: number): string {
+  if (text[fromIndex] === "\r" && text[fromIndex + 1] === "\n") {
+    return text.slice(0, fromIndex) + text.slice(fromIndex + 2);
+  }
+  return text.slice(0, fromIndex) + text.slice(fromIndex + 1);
+}
+
+/** Strip a leading `x-anthropic-billing-header: <value>` line from a system
+ *  prompt text block.
+ *
+ *  Claude Code prepends a `x-anthropic-billing-header: cch=<rotating value>;`
+ *  line to the system prompt on every request. The value rotates per request,
+ *  so it mutates the prompt prefix run-to-run and defeats upstream prefix-cache
+ *  reuse (two otherwise-identical turns never share a cache entry because the
+ *  billing line differs). Stripping just this FIRST line — only when it is
+ *  exactly the billing header at offset 0 — restores a stable prefix. A later
+ *  occurrence lower in the text (e.g. a billing-like string a user pasted
+ *  mid-prompt) is left untouched. Matches cc-switch
+ *  `strip_leading_anthropic_billing_header`.
+ *
+ *  Returns the text with the header line + its single trailing terminator
+ *  removed; returns "" if the header line IS the entire string. */
+function stripLeadingAnthropicBillingHeader(text: string): string {
+  if (!text.startsWith("x-anthropic-billing-header:")) return text;
+  const nl = text.search(/\r\n|\r|\n/);
+  if (nl === -1) return ""; // header line is the entire string
+  return stripTrailingNewline(text, nl);
+}
+
+/** OpenAI `role: tool` messages can only carry text. Media blocks inside an
+ *  Anthropic `tool_result` (e.g. an MCP tool returning an image) would otherwise
+ *  be JSON-stringified into the tool content — useless to the model. So we split
+ *  the content into: `text` for the tool message, and `images` (OpenAI
+ *  `image_url` parts) to re-emit as a synthetic `{role: user}` turn immediately
+ *  after the tool message(s). Matches cc-switch `tool_media.rs`. */
+const TOOL_RESULT_MEDIA_MARKER = "[tool result media moved to the following user message]";
+
+interface ToolResultSerialization {
+  text: string;
+  images: Record<string, unknown>[];
+}
+
+function serializeToolResultContent(toolContent: unknown): ToolResultSerialization {
+  if (toolContent === null || toolContent === undefined) return { text: "", images: [] };
+  if (typeof toolContent === "string") return { text: toolContent, images: [] };
   if (typeof toolContent === "object" && !Array.isArray(toolContent)) {
-    return JSON.stringify(toolContent);
+    return { text: JSON.stringify(toolContent), images: [] };
   }
   if (Array.isArray(toolContent)) {
-    const parts: string[] = [];
+    const textParts: string[] = [];
+    const images: Record<string, unknown>[] = [];
     for (const item of toolContent) {
-      if (
-        item !== null &&
-        typeof item === "object" &&
-        (item as Record<string, unknown>).type === "text"
-      ) {
-        parts.push(String((item as Record<string, unknown>).text ?? ""));
-      } else if (item !== null && typeof item === "object") {
-        parts.push(JSON.stringify(item));
+      if (item !== null && typeof item === "object") {
+        const itemType = (item as Record<string, unknown>).type;
+        if (itemType === "text") {
+          textParts.push(String((item as Record<string, unknown>).text ?? ""));
+        } else if (itemType === "image") {
+          const part = buildImagePartFromBlock(item as ContentBlock);
+          if (part) images.push(part);
+        } else {
+          // Structured blocks (web_search_result, etc.) — textified as before.
+          textParts.push(JSON.stringify(item));
+        }
       } else {
-        parts.push(String(item));
+        textParts.push(String(item));
       }
     }
-    return parts.join("\n");
+    return { text: textParts.join("\n"), images };
   }
-  return String(toolContent);
+  return { text: String(toolContent), images: [] };
+}
+
+/** Build an OpenAI `image_url` content part from an Anthropic image block
+ *  (base64 `source` → `data:` URL, or url `source` → passthrough), preserving
+ *  any `detail` hint. Returns null for unsupported/empty sources. Shared by the
+ *  user-message image path and the tool_result media-extraction path. */
+function buildImagePartFromBlock(block: ContentBlock): Record<string, unknown> | null {
+  const source = getBlockAttr(block, "source", {}) as Record<string, unknown>;
+  if (!source || typeof source !== "object") return null;
+  const sourceType = String(source.type ?? "");
+  if (sourceType === "base64") {
+    const mediaType = String(source.media_type || source.mime_type || "image/png");
+    const data = String(source.data ?? "");
+    if (!data || !isImageMimeType(mediaType)) return null;
+    const url = data.startsWith("data:") ? data : `data:${mediaType};base64,${data}`;
+    return { type: "image_url", image_url: mergeImageDetail({ url }, block) };
+  }
+  if (sourceType === "url") {
+    const url = String(source.url ?? "");
+    if (!url) return null;
+    return { type: "image_url", image_url: mergeImageDetail({ url }, block) };
+  }
+  return null;
 }
 
 function cleanReasoningContent(value: unknown): string | null {
@@ -100,9 +171,12 @@ function iterToolUsesInOrder(blocks: ContentBlock[]): Record<string, unknown>[] 
       type: "function",
       function: {
         name: getBlockAttr(block, "name"),
+        // Canonical (sorted-keys) serialization so the same tool invocation
+        // produces identical wire bytes regardless of input key order —
+        // stable prefix for upstream cache reuse. See canonical.ts.
         arguments:
           typeof toolInput === "object" && toolInput !== null && !Array.isArray(toolInput)
-            ? JSON.stringify(toolInput)
+            ? canonicalJsonStringify(toolInput)
             : String(toolInput),
       },
     });
@@ -186,16 +260,17 @@ function _convertAssistantMessage(
         thinkingParts.push("[redacted thinking]");
       }
     } else if (blockType === "tool_use") {
-    } else if (blockType === "tool_use") {
       const toolInput = getBlockAttr(block, "input", {});
       toolCalls.push({
         id: getBlockAttr(block, "id"),
         type: "function",
         function: {
           name: getBlockAttr(block, "name"),
+          // Canonical (sorted-keys) serialization — stable wire bytes for the
+          // same invocation regardless of input key order. See canonical.ts.
           arguments:
             typeof toolInput === "object" && toolInput !== null && !Array.isArray(toolInput)
-              ? JSON.stringify(toolInput)
+              ? canonicalJsonStringify(toolInput)
               : String(toolInput),
         },
       });
@@ -293,6 +368,7 @@ function _convertUserMessageWithInjection(
 
   const result: Record<string, unknown>[] = [];
   const textParts: string[] = [];
+  const toolMedia: Record<string, unknown>[] = [];
   let cleared = false;
 
   const flushText = (): void => {
@@ -313,15 +389,19 @@ function _convertUserMessageWithInjection(
     } else if (isToolResultBlockType(blockType)) {
       flushText();
       const toolContent = getBlockAttr(block, "content", "");
-      const serialized = serializeToolResultContent(toolContent);
+      const { text, images } = serializeToolResultContent(toolContent);
       const tuid = getBlockAttr(block, "tool_use_id");
       const tuidS = tuid !== null && tuid !== undefined ? String(tuid) : "";
+      const toolText = images.length
+        ? `${text}${text ? "\n" : ""}${TOOL_RESULT_MEDIA_MARKER}`
+        : text;
 
       result.push({
         role: "tool",
         tool_call_id: tuid,
-        content: serialized || "",
+        content: toolText || "",
       });
+      if (images.length) toolMedia.push(...images);
 
       if (pending.remainingToolIds.has(tuidS)) {
         pending.remainingToolIds.delete(tuidS);
@@ -335,6 +415,15 @@ function _convertUserMessageWithInjection(
   }
 
   flushText();
+  // Re-emit extracted tool_result media as a synthetic user turn after the
+  // tool message(s) (+ any deferred assistant blocks) — OpenAI tool messages
+  // cannot carry images (G10).
+  if (toolMedia.length) {
+    result.push({
+      role: "user",
+      content: [{ type: "text", text: TOOL_RESULT_MEDIA_MARKER }, ...toolMedia],
+    });
+  }
   return { messages: result, clearedPending: cleared };
 }
 
@@ -342,6 +431,10 @@ function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[]
   const result: Record<string, unknown>[] = [];
   const textParts: string[] = [];
   let imageParts: Record<string, unknown>[] = [];
+  // Media blocks extracted from tool_result content — re-emitted as a synthetic
+  // {role: user} turn after the tool message(s), since OpenAI tool messages
+  // can't carry images (G10). See serializeToolResultContent.
+  const toolMedia: Record<string, unknown>[] = [];
 
   const flushText = (): void => {
     if (textParts.length) {
@@ -382,32 +475,8 @@ function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[]
       // flushImages before accumulating more text (images need to be co-located)
       textParts.push(String(getBlockAttr(block, "text", "") ?? ""));
     } else if (blockType === "image") {
-      const source = getBlockAttr(block, "source", {}) as Record<string, unknown>;
-      if (source && typeof source === "object") {
-        const sourceType = String(source.type ?? "");
-        if (sourceType === "base64") {
-          const mediaType = String(source.media_type || source.mime_type || "image/png");
-          const data = String(source.data ?? "");
-          if (data && isImageMimeType(mediaType)) {
-            let url = data;
-            if (!data.startsWith("data:")) {
-              url = `data:${mediaType};base64,${data}`;
-            }
-            imageParts.push({
-              type: "image_url",
-              image_url: mergeImageDetail({ url }, block),
-            });
-          }
-        } else if (sourceType === "url") {
-          const url = String(source.url ?? "");
-          if (url) {
-            imageParts.push({
-              type: "image_url",
-              image_url: mergeImageDetail({ url }, block),
-            });
-          }
-        }
-      }
+      const part = buildImagePartFromBlock(block);
+      if (part) imageParts.push(part);
     } else if (blockType === "document") {
       // Anthropic document blocks carry PDFs/other media. OpenAI Chat
       // has no native "document" content part type. We serialize a text
@@ -427,17 +496,29 @@ function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[]
       flushImages();
       flushText();
       const toolContent = getBlockAttr(block, "content", "");
-      const serialized = serializeToolResultContent(toolContent);
+      const { text, images } = serializeToolResultContent(toolContent);
+      const toolText = images.length
+        ? `${text}${text ? "\n" : ""}${TOOL_RESULT_MEDIA_MARKER}`
+        : text;
       result.push({
         role: "tool",
         tool_call_id: getBlockAttr(block, "tool_use_id"),
-        content: serialized || "",
+        content: toolText || "",
       });
+      if (images.length) toolMedia.push(...images);
     }
   }
 
   flushImages();
   flushText();
+  // Re-emit extracted tool_result media as a synthetic user turn (after the tool
+  // messages) — OpenAI tool messages cannot carry images (G10).
+  if (toolMedia.length) {
+    result.push({
+      role: "user",
+      content: [{ type: "text", text: TOOL_RESULT_MEDIA_MARKER }, ...toolMedia],
+    });
+  }
   return result;
 }
 
@@ -592,13 +673,18 @@ export class AnthropicToOpenAIConverter {
     system: unknown,
   ): Record<string, string> | null {
     if (typeof system === "string") {
-      return { role: "system", content: system };
+      // Strip the rotating `x-anthropic-billing-header:` first line so the
+      // system prompt has a stable prefix (upstream prefix-cache reuse).
+      const stripped = stripLeadingAnthropicBillingHeader(system).trim();
+      return stripped ? { role: "system", content: stripped } : null;
     }
     if (Array.isArray(system)) {
       const textParts: string[] = [];
       for (const block of system) {
         if (getBlockType(block as ContentBlock) === "text") {
-          const text = String(getBlockAttr(block as ContentBlock, "text", "") ?? "");
+          const text = stripLeadingAnthropicBillingHeader(
+            String(getBlockAttr(block as ContentBlock, "text", "") ?? ""),
+          ).trim();
           if (text) textParts.push(text);
         }
       }

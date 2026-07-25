@@ -295,10 +295,151 @@ describe("AnthropicToOpenAIConverter", () => {
       expect(AnthropicToOpenAIConverter.convertSystemPrompt(null)).toBeNull();
     });
 
-    it("returns object with empty content for empty string", () => {
-      const result = AnthropicToOpenAIConverter.convertSystemPrompt("");
-      expect(result).toEqual({ role: "system", content: "" });
+    it("returns null for an empty string (drops empty system, G6)", () => {
+      expect(AnthropicToOpenAIConverter.convertSystemPrompt("")).toBeNull();
     });
+  });
+});
+
+describe("convertSystemPrompt — x-anthropic-billing-header stripping (G6)", () => {
+  it("strips a leading billing-header line from a string system prompt", () => {
+    const sys = "x-anthropic-billing-header: cch=abc123; cc_version=1;\nYou are helpful.";
+    const result = AnthropicToOpenAIConverter.convertSystemPrompt(sys);
+    expect(result).toEqual({ role: "system", content: "You are helpful." });
+  });
+
+  it("strips the leading billing-header line from each text block in an array system prompt", () => {
+    const result = AnthropicToOpenAIConverter.convertSystemPrompt([
+      { type: "text", text: "x-anthropic-billing-header: cch=zzz;\nPart A." },
+      { type: "text", text: "Part B." },
+    ]);
+    expect(result).toEqual({ role: "system", content: "Part A.\n\nPart B." });
+  });
+
+  it("returns null when the system prompt is ONLY the billing header", () => {
+    expect(AnthropicToOpenAIConverter.convertSystemPrompt("x-anthropic-billing-header: cch=rotating;")).toBeNull();
+  });
+
+  it("leaves a billing-like string not at offset 0 untouched", () => {
+    // Only the FIRST line is stripped when it is the billing header.
+    const sys = "You are helpful.\nx-anthropic-billing-header: not at start";
+    const result = AnthropicToOpenAIConverter.convertSystemPrompt(sys);
+    expect(result).toEqual({ role: "system", content: sys });
+  });
+
+  it("handles CRLF after the billing header line", () => {
+    const sys = "x-anthropic-billing-header: cch=x;\r\nYou are helpful.";
+    const result = AnthropicToOpenAIConverter.convertSystemPrompt(sys);
+    expect(result).toEqual({ role: "system", content: "You are helpful." });
+  });
+});
+
+describe("tool_use arguments canonicalization (G7)", () => {
+  it("serializes tool_use input with sorted keys (canonical args)", () => {
+    const messages: AnthropicMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "tu_1", name: "search", input: { z: 1, a: 2, m: 0 } },
+        ],
+      },
+    ];
+    const result = AnthropicToOpenAIConverter.convertMessages(messages);
+    const msg = result[0];
+    const args = (msg.tool_calls as Record<string, unknown>[])[0].function.arguments;
+    expect(args).toBe(JSON.stringify({ a: 2, m: 0, z: 1 }));
+  });
+
+  it("produces stable arguments regardless of input key order", () => {
+    const a = AnthropicToOpenAIConverter.convertMessages([
+      { role: "assistant", content: [{ type: "tool_use", id: "t", name: "f", input: { b: 2, a: 1 } }] },
+    ]);
+    const b = AnthropicToOpenAIConverter.convertMessages([
+      { role: "assistant", content: [{ type: "tool_use", id: "t", name: "f", input: { a: 1, b: 2 } }] },
+    ]);
+    expect((a[0].tool_calls as Record<string, unknown>[])[0].function.arguments).toBe(
+      (b[0].tool_calls as Record<string, unknown>[])[0].function.arguments,
+    );
+  });
+});
+
+describe("tool_result media extraction (G10)", () => {
+  it("extracts an image block from tool_result into a synthetic user turn", () => {
+    const messages: AnthropicMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "tu_1", name: "screenshot", input: {} }],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tu_1",
+            content: [
+              { type: "text", text: "captured" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: "YWJj" } },
+            ],
+          },
+        ],
+      },
+    ];
+    const result = AnthropicToOpenAIConverter.convertMessages(messages);
+    // The tool message keeps the text content (image no longer stringified in).
+    const toolMsg = result.find((m) => m.role === "tool")!;
+    expect(toolMsg.tool_call_id).toBe("tu_1");
+    expect(String(toolMsg.content)).toContain("captured");
+    expect(String(toolMsg.content)).not.toContain("\"type\":\"image\""); // image not stringified
+    expect(String(toolMsg.content)).toContain("[tool result media moved to the following user message]");
+
+    // A synthetic user turn carries the image as an image_url part + the marker.
+    const userMsgs = result.filter((m) => m.role === "user");
+    const synthetic = userMsgs.find(
+      (m) => Array.isArray(m.content) && (m.content as Record<string, unknown>[]).some((p) => p.type === "image_url"),
+    );
+    expect(synthetic).toBeDefined();
+    const parts = synthetic!.content as Record<string, unknown>[];
+    expect(parts.some((p) => p.type === "text")).toBe(true); // marker
+    const imgPart = parts.find((p) => p.type === "image_url")!;
+    const imageUrl = imgPart.image_url as Record<string, unknown>;
+    expect(imageUrl.url).toBe("data:image/png;base64,YWJj");
+  });
+
+  it("does NOT synthesize a media turn for text-only tool results (no regression)", () => {
+    const messages: AnthropicMessage[] = [
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "t1", content: "plain result" }],
+      },
+    ];
+    const result = AnthropicToOpenAIConverter.convertMessages(messages);
+    expect(result).toEqual([{ role: "tool", tool_call_id: "t1", content: "plain result" }]);
+    expect(result.some((m) => m.role === "user")).toBe(false);
+  });
+
+  it("keeps structured (web_search_result) tool content as textified JSON, unchanged", () => {
+    // Regression guard: G10 must not alter the web_search_result tool-content
+    // serialization path (it has no image blocks).
+    const messages: AnthropicMessage[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "web_search_tool_result",
+            tool_use_id: "st_1",
+            content: [{ type: "web_search_result", url: "https://example.com", title: "Example" }],
+          },
+        ],
+      },
+    ];
+    const result = AnthropicToOpenAIConverter.convertMessages(messages);
+    expect(result).toEqual([
+      {
+        role: "tool",
+        tool_call_id: "st_1",
+        content: '{"type":"web_search_result","url":"https://example.com","title":"Example"}',
+      },
+    ]);
   });
 });
 

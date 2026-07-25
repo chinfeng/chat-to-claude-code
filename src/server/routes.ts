@@ -3,12 +3,13 @@
 import { randomUUID } from "crypto";
 import { buildBaseRequestBody, ReasoningReplayMode } from "../conversion/converter.js";
 import type { RequestData } from "../conversion/converter.js";
-import { streamOpenAIChatToAnthropicSse, UpstreamAbortedError } from "../transport/stream.js";
+import { streamOpenAIChatToAnthropicSse, UpstreamAbortedError, extractUsageInfo } from "../transport/stream.js";
 import type { StreamChunk } from "../transport/stream.js";
 import { estimateInputTokens } from "../core/tokens.js";
 import { invalidRequestError, authenticationError, upstreamError, serverError } from "../core/errors.js";
 import type { ServerConfig, ServerToolConfig } from "./config.js";
 import { resolveModelExtra, deepMerge } from "./config.js";
+import { prepareCanonicalBody } from "../conversion/canonical.js";
 import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder, mapErrorType, DEFAULT_PING_INTERVAL_MS } from "../sse/builder.js";
 import { createDumpSession, type DumpTermination, type TerminationReason, type ServerToolLogEntry } from "../core/dump.js";
 import {
@@ -92,6 +93,23 @@ function parseMessagesBody(body: unknown): { data: RequestData; error?: never } 
   };
 }
 
+/** Request OpenAI-standard SSE usage accounting from the upstream. The OpenAI
+ *  Chat Completions stream omits the trailing `usage` object unless
+ *  `stream_options.include_usage=true`; without it the downstream Anthropic
+ *  message_delta cannot report real input/output token counts (or the cache
+ *  buckets G3 reads from `prompt_tokens_details`). We stream every upstream
+ *  request, so always request it. Preserves any other `stream_options` keys the
+ *  caller set (e.g. via `--upstream-extra-params`). Matches cc-switch
+ *  `inject_openai_stream_include_usage`. */
+function applyIncludeUsage(body: Record<string, unknown>): void {
+  const so = body.stream_options;
+  if (so && typeof so === "object" && !Array.isArray(so)) {
+    (so as Record<string, unknown>).include_usage = true;
+  } else {
+    body.stream_options = { include_usage: true };
+  }
+}
+
 /** Build the upstream OpenAI-compatible fetch request. */
 function buildUpstreamRequest(requestData: RequestData, apiKey: string, config: ServerConfig): { request: Request; requestBody: string; requestHeaders: Record<string, string> } {
   let body = buildBaseRequestBody(requestData, 4096, ReasoningReplayMode.THINK_TAGS);
@@ -102,6 +120,11 @@ function buildUpstreamRequest(requestData: RequestData, apiKey: string, config: 
   if (Object.keys(extra).length) {
     body = deepMerge(body, extra);
   }
+  // G1: request SSE usage so message_delta can report real token counts.
+  //     G7: canonicalize (sort keys, drop private `_` params) AFTER all merges
+  //     so the upstream wire bytes are stable run-to-run (prefix-cache reuse).
+  applyIncludeUsage(body);
+  body = prepareCanonicalBody(body);
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -347,6 +370,8 @@ function buildUpstreamRequestBodyOnly(
   if (Object.keys(extra).length) {
     body = deepMerge(body, extra);
   }
+  applyIncludeUsage(body);
+  body = prepareCanonicalBody(body);
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -697,14 +722,15 @@ async function handleServerToolRequest(
     while (iteration < MAX_ITERATIONS) {
         iteration++;
 
-        const currentBody = JSON.stringify({
+        const currentBody = JSON.stringify(prepareCanonicalBody({
             model: requestData.model,
             messages: upstreamMessages,
             max_tokens: requestData.max_tokens ?? 32000,
             stream: true,
+            stream_options: { include_usage: true },
             ...(upstreamTools ? { tools: upstreamTools } : {}),
             thinking: { type: "enabled" },
-        });
+        }));
 
         // Log each iteration's upstream request
         dump.logServerTool({
@@ -944,14 +970,15 @@ async function handleServerToolRequest(
     }
 
     // === Final upstream request to get streaming text response ===
-    const finalBody = JSON.stringify({
+    const finalBody = JSON.stringify(prepareCanonicalBody({
         model: requestData.model,
         messages: upstreamMessages,
         max_tokens: requestData.max_tokens ?? 32000,
         stream: true,
+        stream_options: { include_usage: true },
         ...(upstreamTools ? { tools: upstreamTools } : {}),
         thinking: { type: "enabled" },
-    });
+    }));
 
     let finalRes: Response;
     try {
@@ -1063,8 +1090,26 @@ async function handleServerToolRequest(
                 const finalReader = finalResBody!.getReader();
                 const finalRawChunks: string[] = [];
                 const finalStreamChunks = iterUpstreamChunks(finalReader, finalRawChunks);
+                // G1+G4: finalBody requests stream_options.include_usage, so the
+                // upstream sends a trailing usage chunk. The inner stream below is
+                // built with skipMessageLifecycle (the outer `sse` owns the
+                // message lifecycle), so tee the raw chunks to capture usage and
+                // feed REAL input/output token counts (prompt minus cache, real
+                // completion_tokens) into the outer message_delta — otherwise the
+                // agentic turn reports only an estimate of the pre-amble text.
+                let finalUsage: ReturnType<typeof extractUsageInfo> = null;
+                const teeFinalChunks = (async function* () {
+                  for await (const chunk of finalStreamChunks) {
+                    const c = chunk as StreamChunk;
+                    if (c?.usage) {
+                      const u = extractUsageInfo(c.usage);
+                      if (u) finalUsage = u;
+                    }
+                    yield chunk;
+                  }
+                })();
                 const finalSseStream = streamOpenAIChatToAnthropicSse(
-                    finalStreamChunks as AsyncIterable<StreamChunk>,
+                    teeFinalChunks as AsyncIterable<StreamChunk>,
                     requestData,
                     inputTokens,
                     config.enableThinking,
@@ -1077,8 +1122,11 @@ async function handleServerToolRequest(
                     emit(event);
                 }
 
-                // 4. Emit message_delta and message_stop
-                emit(sse.message_delta("end_turn", sse.estimate_output_tokens()));
+                // 4. Emit message_delta and message_stop. With include_usage the
+                //    message_delta reports REAL usage (G4); falls back to the
+                //    estimate when the upstream sent no usage chunk.
+                if (finalUsage) sse["_usageInfo"] = finalUsage;
+                emit(sse.message_delta("end_turn", finalUsage?.completion_tokens ?? sse.estimate_output_tokens()));
                 emit(sse.message_stop());
 
                 // 5. Finalize dump

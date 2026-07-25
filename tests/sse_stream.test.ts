@@ -747,4 +747,137 @@ describe("SSE stream forwarding", () => {
       try { rmSync(tmpDir, { recursive: true }); } catch {}
     }
   });
+
+  // -----------------------------------------------------------------------
+  // G1: request OpenAI-standard `stream_options.include_usage` from the
+  //     upstream so the trailing usage chunk arrives and message_delta can
+  //     report real token counts (paired with G3 cache extraction + G4 real
+  //     input_tokens). G7: the upstream body is canonicalized (sorted keys,
+  //     private `_` params dropped) for stable prefix-cache bytes.
+  // -----------------------------------------------------------------------
+
+  it("requests stream_options.include_usage on every upstream stream (G1)", async () => {
+    let capturedBody: string | undefined;
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      capturedBody = typeof init?.body === "string" ? init.body : String(init?.body ?? "");
+      const body = textToReadableStream(typicalUpstreamSse());
+      return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    try {
+      const res = await routeRequest(makeMessagesRequest(), TEST_CONFIG);
+      await collectResponseBody(res);
+    } finally {
+      globalThis.fetch = original;
+    }
+
+    expect(capturedBody).toBeDefined();
+    const parsed = JSON.parse(capturedBody!);
+    expect(parsed.stream_options).toEqual({ include_usage: true });
+  });
+
+  it("preserves a caller-supplied stream_options key alongside include_usage", async () => {
+    // --upstream-extra-params (or modelOverrides) could set extra stream_options
+    // keys; include_usage must be added, not clobber the existing object.
+    const configWithExtra: ServerConfig = {
+      ...TEST_CONFIG,
+      modelOverrides: [{ pattern: "gpt-4o", extra: { stream_options: { count_tokens: true } } }],
+    };
+    let capturedBody: string | undefined;
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedBody = typeof init?.body === "string" ? init.body : String(init?.body ?? "");
+      const body = textToReadableStream(typicalUpstreamSse());
+      return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    try {
+      const res = await routeRequest(makeMessagesRequest(), configWithExtra);
+      await collectResponseBody(res);
+    } finally {
+      globalThis.fetch = original;
+    }
+
+    const parsed = JSON.parse(capturedBody!);
+    expect(parsed.stream_options.include_usage).toBe(true);
+    expect(parsed.stream_options.count_tokens).toBe(true);
+  });
+
+  it("canonicalizes the upstream body and drops private `_`-prefixed params (G7)", async () => {
+    // Send a request with a `_`-prefixed private param and an out-of-order top
+    // object; assert the captured upstream body has sorted keys and no `_` keys.
+    const requestWithPrivate = makeMessagesRequest({
+      // tools with a schema property whose name starts with `_` (must survive —
+      // it is inside the JSON-Schema `properties` name map, NOT a private param).
+      tools: [
+        {
+          name: "t",
+          description: "d",
+          input_schema: { type: "object", properties: { _id: { type: "string" }, name: { type: "string" } } },
+        },
+      ],
+    });
+    let capturedBody: string | undefined;
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedBody = typeof init?.body === "string" ? init.body : String(init?.body ?? "");
+      const body = textToReadableStream(typicalUpstreamSse());
+      return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    try {
+      const res = await routeRequest(requestWithPrivate, TEST_CONFIG);
+      await collectResponseBody(res);
+    } finally {
+      globalThis.fetch = original;
+    }
+
+    const parsed = JSON.parse(capturedBody!);
+    // Top-level keys are sorted.
+    expect(Object.keys(parsed)).toEqual([...Object.keys(parsed)].sort());
+    // The `_id` schema property name survives (inside `properties` name map).
+    const tool = (parsed.tools as Record<string, unknown>[])[0].function as Record<string, unknown>;
+    const props = (tool.parameters as Record<string, unknown>).properties as Record<string, unknown>;
+    expect("_id" in props).toBe(true);
+    expect("name" in props).toBe(true);
+  });
+
+  it("reports real input_tokens from prompt_tokens_details (G3+G4) end-to-end", async () => {
+    // Upstream sends cache hits via the OpenAI-standard prompt_tokens_details
+    // (GLM-5.2 / newapi form), with NO Anthropic-compat direct cache fields, and
+    // NO finish_reason (only [DONE]) — exercising G1 (usage arrives), G3 (cache
+    // read from prompt_tokens_details) and G4 (message_delta real input_tokens).
+    const sseBody = [
+      sseData({ id: "c", object: "chat.completion.chunk", created: 1, model: "gpt-4o", choices: [{ index: 0, delta: { content: "hi" }, finish_reason: null }] }),
+      sseData({
+        id: "c",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 100, completion_tokens: 7, prompt_tokens_details: { cached_tokens: 30, cache_write_tokens: 10 } },
+      }),
+      SSE_DONE,
+    ].join("");
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(textToReadableStream(sseBody), { status: 200, headers: { "Content-Type": "text/event-stream" } })
+    ) as typeof fetch;
+
+    try {
+      const res = await routeRequest(makeMessagesRequest(), TEST_CONFIG);
+      const body = await collectResponseBody(res);
+      const events = parseSseResponse(body);
+      const delta = events.find((e) => e.event === "message_delta")!;
+      const usage = JSON.parse(delta.data).usage as Record<string, number>;
+      // input = 100 - 30 (cached) - 10 (cache_write) = 60
+      expect(usage.input_tokens).toBe(60);
+      expect(usage.cache_read_input_tokens).toBe(30);
+      expect(usage.cache_creation_input_tokens).toBe(10);
+      expect(usage.output_tokens).toBe(7);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
 });

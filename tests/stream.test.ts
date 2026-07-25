@@ -586,6 +586,141 @@ describe("streamOpenAIChatToAnthropicSse", () => {
   });
 });
 
+/** Extract the parsed `message_delta` event data from a raw SSE string. */
+function parseMessageDeltaEvent(sse: string): Record<string, unknown> | null {
+  const blocks = sse.split("\n\n");
+  for (const block of blocks) {
+    if (!block.startsWith("event: message_delta")) continue;
+    const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
+    if (dataLine) {
+      try { return JSON.parse(dataLine.slice(6)); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+/** Extract the parsed `message_start` event data from a raw SSE string. */
+function parseMessageStartEvent(sse: string): Record<string, unknown> | null {
+  const blocks = sse.split("\n\n");
+  for (const block of blocks) {
+    if (!block.startsWith("event: message_start")) continue;
+    const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
+    if (dataLine) {
+      try { return JSON.parse(dataLine.slice(6)); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+describe("streamOpenAIChatToAnthropicSse usage accounting (G1+G3+G4)", () => {
+  it("reads cache buckets from prompt_tokens_details (G3) into message_delta", async () => {
+    // GLM-5.2 / OpenAI surface cache hits in prompt_tokens_details, NOT in the
+    // Anthropic-compat direct cache_*_input_tokens fields.
+    const chunks: StreamChunk[] = [
+      { choices: [{ delta: { content: "hi" }, finish_reason: null }] },
+      {
+        choices: [{ delta: {}, finish_reason: "stop" }],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 5,
+          prompt_tokens_details: { cached_tokens: 30, cache_write_tokens: 10 },
+        },
+      },
+    ];
+
+    const stream = streamOpenAIChatToAnthropicSse(chunksToStream(chunks), TEST_REQUEST, 10, true);
+    const output = await collectStream(stream);
+    const delta = parseMessageDeltaEvent(output)!;
+
+    // input_tokens = prompt_tokens - cache_read - cache_creation (saturating).
+    expect((delta.usage as Record<string, unknown>).input_tokens).toBe(60);
+    expect((delta.usage as Record<string, unknown>).cache_read_input_tokens).toBe(30);
+    expect((delta.usage as Record<string, unknown>).cache_creation_input_tokens).toBe(10);
+    expect((delta.usage as Record<string, unknown>).output_tokens).toBe(5);
+  });
+
+  it("prefers the Anthropic-compat direct cache fields over prompt_tokens_details", async () => {
+    const chunks: StreamChunk[] = [
+      { choices: [{ delta: { content: "hi" }, finish_reason: null }] },
+      {
+        choices: [{ delta: {}, finish_reason: "stop" }],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 5,
+          cache_read_input_tokens: 40, // direct takes priority
+          cache_creation_input_tokens: 20,
+          prompt_tokens_details: { cached_tokens: 30, cache_write_tokens: 10 },
+        },
+      },
+    ];
+
+    const output = await collectStream(
+      streamOpenAIChatToAnthropicSse(chunksToStream(chunks), TEST_REQUEST, 10, true),
+    );
+    const delta = parseMessageDeltaEvent(output)!;
+    // Direct fields win: 100 - 40 - 20 = 40 input_tokens.
+    expect((delta.usage as Record<string, unknown>).input_tokens).toBe(40);
+    expect((delta.usage as Record<string, unknown>).cache_read_input_tokens).toBe(40);
+    expect((delta.usage as Record<string, unknown>).cache_creation_input_tokens).toBe(20);
+  });
+
+  it("reports real input_tokens in message_delta (G4) instead of the estimate", async () => {
+    const chunks: StreamChunk[] = [
+      { choices: [{ delta: { content: "hi" }, finish_reason: null }] },
+      {
+        choices: [{ delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1234, completion_tokens: 7 },
+      },
+    ];
+
+    // inputTokens estimate is 10 — message_delta must report the REAL 1234,
+    // not the estimate.
+    const output = await collectStream(
+      streamOpenAIChatToAnthropicSse(chunksToStream(chunks), TEST_REQUEST, 10, true),
+    );
+    const delta = parseMessageDeltaEvent(output)!;
+    expect((delta.usage as Record<string, unknown>).input_tokens).toBe(1234);
+    expect((delta.usage as Record<string, unknown>).output_tokens).toBe(7);
+
+    // message_start is emitted BEFORE the usage chunk, so it still uses the
+    // estimate (no usage has arrived yet) — unchanged from prior behavior.
+    const start = parseMessageStartEvent(output)!;
+    const startUsage = (start.message as Record<string, unknown>).usage as Record<string, unknown>;
+    expect(startUsage.input_tokens).toBe(10);
+  });
+
+  it("saturates input_tokens to 0 when cache buckets exceed prompt_tokens (clamp)", async () => {
+    const chunks: StreamChunk[] = [
+      { choices: [{ delta: { content: "hi" }, finish_reason: null }] },
+      {
+        choices: [{ delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 10, completion_tokens: 1, prompt_tokens_details: { cached_tokens: 100 } },
+      },
+    ];
+
+    const output = await collectStream(
+      streamOpenAIChatToAnthropicSse(chunksToStream(chunks), TEST_REQUEST, 10, true),
+    );
+    const delta = parseMessageDeltaEvent(output)!;
+    expect((delta.usage as Record<string, unknown>).input_tokens).toBe(0);
+  });
+
+  it("falls back to the inputTokens estimate when no usage chunk arrives", async () => {
+    // No usage (e.g. upstream ignored include_usage) — message_delta must use
+    // the constructor estimate, preserving prior behavior.
+    const chunks: StreamChunk[] = [
+      { choices: [{ delta: { content: "hi" }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ];
+
+    const output = await collectStream(
+      streamOpenAIChatToAnthropicSse(chunksToStream(chunks), TEST_REQUEST, 42, true),
+    );
+    const delta = parseMessageDeltaEvent(output)!;
+    expect((delta.usage as Record<string, unknown>).input_tokens).toBe(42);
+  });
+});
+
 describe("inferToolNameByIndex", () => {
   const baseRequest: RequestData = {
     model: "z-ai/glm-5.1",
