@@ -22,23 +22,30 @@ export class UpstreamStreamError extends Error {
  * Thrown when the upstream CONNECTION terminates mid-stream — either a read
  * error/reset (the upstream socket was closed unexpectedly) or a clean EOF
  * with no `finish_reason` (the upstream closed without completing the
- * generation). Carries no error code, so the route layer maps it to the
- * generic retryable `api_error` type.
+ * generation). Carries no upstream error code.
  *
  * Propagated to the route layer, which first close_all_blocks()'s any open
  * content blocks (well-formed prefix), then emits a top-level SSE
- * `event: error` (api_error) — but NO message_delta/message_stop and NO
- * self-defined finish_reason, so the failure is never disguised as a completed
- * assistant turn and never poisons conversation history. The explicit
- * `event: error` lets claude-code classify the failure as retryable and retry
- * the turn, instead of seeing an incomplete stream ("message_start with no
- * message_stop") that it reports as "API returned an empty or malformed
- * response (HTTP 200)" and does NOT retry.
+ * `event: error` — but NO message_delta/message_stop and NO self-defined
+ * finish_reason, so the failure is never disguised as a completed assistant
+ * turn and never poisons conversation history.
  *
- * Same downstream treatment as UpstreamStreamError (upstream sent an explicit
- * error object while still connected) — which differs only in that it carries a
- * code, so mapErrorType may yield a more specific error type (e.g.
- * overloaded_error for 429/529).
+ * Retry: the route layer emits the cc-switch-aligned mid-stream error shape
+ * (`error.type = "stream_error"` with the descriptive upstream message; see
+ * `buildMidStreamErrorSse`). claude-code's mid-stream retry predicate `sym`
+ * fires only on HTTP 429/5xx (impossible mid-stream — 200 is already committed)
+ * or the literal substring `'"type":"overloaded_error"'` inside `e.message`
+ * (the SDK builds `e.message` from `body.error.message`, not `error.type`).
+ * `stream_error` has neither, so claude-code does NOT retry a partially-
+ * streamed turn. This is the accepted cc-switch trade-off: cc-switch recovers
+ * from aborts by transparently failing over to another provider BEFORE
+ * committing the 200 (a first-byte gate), and relies on the HTTP-status retry
+ * trigger only for pre-commit failures; post-commit, it surfaces the error and
+ * lets the client not retry. Same downstream `event: error` treatment as
+ * UpstreamStreamError (upstream sent an explicit error object while still
+ * connected) — that class carries a code but it is not used to alter the
+ * error-event type, since cc-switch's streaming converter emits a single
+ * non-retryable `stream_error` regardless of cause.
  */
 export class UpstreamAbortedError extends Error {
   constructor(message: string) {

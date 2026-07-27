@@ -34,6 +34,39 @@ export function mapErrorType(
   return "api_error";
 }
 
+/** Build the downstream top-level `event: error` SSE line for a mid-stream
+ *  failure.
+ *
+ *  This is the shape cc-switch's OpenAI-Chat→Anthropic converter emits when the
+ *  upstream body stream errors mid-iteration (`Err(e)` in
+ *  `prime_streaming_response`/`create_anthropic_sse_stream`): a top-level
+ *  `event: error` whose error object is `{ type: "stream_error", message }` —
+ *  a custom (non-Anthropic-standard) type carrying our descriptive upstream
+ *  failure text. Crucially we do NOT emit `message_delta`/`message_stop`
+ *  alongside it, so the turn is never disguised as completed and never poisons
+ *  conversation history; the SDK throws on the error event and discards the
+ *  partial.
+ *
+ *  By design this does NOT trigger a claude-code client retry. claude-code's
+ *  mid-stream retry predicate `sym` only fires on HTTP status 429/5xx (impossible
+ *  here — HTTP 200 is already committed) or the literal substring
+ *  `'"type":"overloaded_error"'` inside `e.message` (the SDK builds `e.message`
+ *  from `error.message`, not `error.type`). cc-switch deliberately declines to
+ *  use that escape hatch on a partially-streamed turn: it hides aborts by
+ *  transparently failing over to another provider BEFORE committing the 200
+ *  (a `prime_streaming_response` first-byte gate), and only relies on the
+ *  HTTP-status retry trigger when a request fails BEFORE any SSE is sent (the
+ *  pre-commit path this proxy already exposes via `upstreamError(..., mappedStatus)`).
+ *  Post-commit, cc-switch surfaces `stream_error` and lets the client not retry —
+ *  the trade-off this proxy now matches.
+ */
+export function buildMidStreamErrorSse(message: string): string {
+  return formatSseEvent("error", {
+    type: "error",
+    error: { type: "stream_error", message },
+  });
+}
+
 function safeUsageInt(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }

@@ -10,7 +10,7 @@ import { invalidRequestError, authenticationError, upstreamError, serverError } 
 import type { ServerConfig, ServerToolConfig } from "./config.js";
 import { resolveModelExtra, deepMerge } from "./config.js";
 import { prepareCanonicalBody } from "../conversion/canonical.js";
-import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder, mapErrorType, DEFAULT_PING_INTERVAL_MS } from "../sse/builder.js";
+import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder, buildMidStreamErrorSse, DEFAULT_PING_INTERVAL_MS } from "../sse/builder.js";
 import { createDumpSession, type DumpTermination, type TerminationReason, type ServerToolLogEntry } from "../core/dump.js";
 import {
   isServerToolType,
@@ -180,10 +180,12 @@ async function* iterUpstreamChunks(
         ({ done, value } = await reader.read());
       } catch (e) {
         // Upstream connection dropped mid-stream (reset/abort). Propagate as
-        // UpstreamAbortedError (no code → api_error) so the route layer emits an
-        // explicit, retryable `event: error` after closing any open content
-        // blocks — never an abrupt close, which claude-code reports as "empty
-        // or malformed response (HTTP 200)" and does not retry.
+        // UpstreamAbortedError; the route layer catch builds a cc-switch-aligned
+        // mid-stream `event: error` (error.type=stream_error, descriptive
+        // message, NO overloaded_error substring) after closing any open content
+        // blocks — never an abrupt close, which claude-code reports as "empty or
+        // malformed response (HTTP 200)" and never persists. By design this does
+        // NOT trigger a claude-code client retry (see buildMidStreamErrorSse).
         const msg = e instanceof Error ? e.message : String(e);
         throw new UpstreamAbortedError(`Upstream stream read error: ${msg}`);
       }
@@ -609,26 +611,26 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
           } catch (e) {
             if (!downstreamAborted) {
               terminationReason = "upstream_abort";
-              // Surface the failure as an explicit `event: error` — for BOTH an
-              // upstream-embedded error object (UpstreamStreamError, carries a
-              // code) and a connection abort (UpstreamAbortedError, no code →
-              // api_error). An SSE stream that simply closes mid-message
-              // (message_start emitted, no message_stop) is reported by
-              // claude-code as `API returned an empty or malformed response
-              // (HTTP 200)` and is NOT retried. Emitting a real `event: error`
-              // (a recognized Anthropic SSE error event) lets claude-code
-              // classify it as retryable (api_error/overloaded_error) and retry
-              // the turn — matching cc-switch's read-error handling. The error
-              // is NOT wrapped in a text content block and NO message_stop after
-              // it, so the turn is never persisted as completed: the SDK throws
-              // on the error event and discards the partial message (no
-              // conversation-history poisoning — the original pre-78484ae bug
-              // poisoned history by emitting the error as a text_delta + fake
-              // end_turn + message_stop, none of which we do here).
+              // Surface the failure as a real top-level `event: error` — NOT an
+              // abrupt close (message_start emitted, no message_stop): claude-code
+              // reports that as "empty or malformed response (HTTP 200)" and
+              // never persists it. NOT wrapped in a text content block with a
+              // fake message_stop either: that would persist a failed/partial
+              // turn into conversation history (the original pre-78484ae bug).
+              //
+              // We emit the cc-switch-aligned mid-stream error shape:
+              // `error.type = "stream_error"` with the descriptive upstream
+              // failure message, and NO message_delta/message_stop. claude-code's
+              // retry predicate `sym` only fires on HTTP 429/5xx (impossible
+              // mid-stream — 200 is already committed) or the literal substring
+              // `'"type":"overloaded_error"'` inside `e.message`; we emit neither,
+              // so claude-code does NOT retry. This is the accepted cc-switch
+              // trade-off: post-commit mid-stream aborts are surfaced (not
+              // retried), and recovery is meant to come from the PRE-commit path
+              // (a real HTTP 429/5xx status via `upstreamError(..., mappedStatus)`),
+              // which this proxy already exposes. See buildMidStreamErrorSse.
               const msg = e instanceof Error ? e.message : String(e);
-              const code = (e instanceof Error && "code" in e) ? (e as { code?: number }).code : undefined;
-              const errType = mapErrorType(code);
-              const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: errType, message: msg } })}\n\n`;
+              const errLine = buildMidStreamErrorSse(msg);
               downstreamChunks.push(errLine);
               try { controller.enqueue(encoder.encode(errLine)); } catch { /* stream already closed */ }
             }
@@ -1144,18 +1146,15 @@ async function handleServerToolRequest(
                 dump.setTiming({ ttfb: Date.now() - requestStartMs, totalTime: Date.now() - requestStartMs });
             } catch (e) {
                 if (!abortSignal?.aborted) {
-                    // Surface the failure as `event: error` for every non-client-
-                    // aborted cause — including an upstream connection abort
-                    // (UpstreamAbortedError: socket reset, or the final stream
-                    // ending without a finish_reason) — so claude-code sees a
-                    // retryable error event (api_error) rather than an
-                    // incomplete stream it would report as "empty or malformed
-                    // response (HTTP 200)" and not retry. See the standard flow
-                    // catch for the full rationale.
+                    // Same cc-switch-aligned mid-stream `event: error` handling
+                    // as the standard flow catch (see there for rationale): emit
+                    // `error.type = "stream_error"` with the descriptive upstream
+                    // message, NO `overloaded_error`/substring and NO
+                    // message_delta/message_stop — so the partial is discarded
+                    // (no history poisoning) and claude-code does NOT retry a
+                    // partially-streamed turn (the accepted cc-switch trade-off).
                     const msg = e instanceof Error ? e.message : String(e);
-                    const code = (e instanceof Error && "code" in e) ? (e as { code?: number }).code : undefined;
-                    const errType = mapErrorType(code);
-                    const errLine = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: errType, message: msg } })}\n\n`;
+                    const errLine = buildMidStreamErrorSse(msg);
                     try { emit(errLine); } catch { /* stream closed */ }
                 }
                 dump.writeDownstreamResponse({

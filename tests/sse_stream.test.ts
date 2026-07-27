@@ -381,12 +381,14 @@ describe("SSE stream forwarding", () => {
 
   // -----------------------------------------------------------------------
   // Bug 4: an upstream connection abort surfaces downstream as an explicit
-  //         `event: error` (api_error) so claude-code retries — never an abrupt
-  //         close, which claude-code reports as "empty or malformed response
-  //         (HTTP 200)" and does NOT retry.
+  //         `event: error` carrying `stream_error` (cc-switch's mid-stream
+  //         converter error type) so claude-code reports the failure cleanly
+  //         and never persists a partial turn — never an abrupt close, which it
+  //         reports as "empty or malformed response (HTTP 200)". By design this
+  //         does NOT trigger a client retry (the accepted cc-switch trade-off).
   // -----------------------------------------------------------------------
 
-  it("surfaces an upstream connection abort as an SSE error event so the client retries", async () => {
+  it("surfaces an upstream connection abort as a cc-switch-style stream_error SSE event (no client retry)", async () => {
     const goodPrefix = sseData({
       id: "chatcmpl-err",
       object: "chat.completion.chunk",
@@ -411,16 +413,28 @@ describe("SSE stream forwarding", () => {
     // finish_reason) must surface as a real top-level `event: error` — NOT be
     // swallowed as an abrupt close. claude-code treats a stream that closes
     // mid-message (message_start emitted, no message_stop) as malformed and
-    // reports "API returned an empty or malformed response (HTTP 200)" WITHOUT
-    // retrying; an explicit `event: error` (here api_error, since the abort
-    // carries no code) lets it classify the failure as retryable and retry the
-    // turn. This matches cc-switch's read-error handling.
+    // reports "API returned an empty or malformed response (HTTP 200)" — so we
+    // emit the error event explicitly. This matches cc-switch's OpenAI→Anthropic
+    // converter, which emits `error.type = "stream_error"` with a descriptive
+    // message on a mid-stream `Err(e)`. claude-code's mid-stream retry predicate
+    // `sym` only fires on HTTP 429/5xx (impossible mid-stream — 200 already
+    // committed) or the literal substring `'"type":"overloaded_error"'` inside
+    // `e.message` (the SDK builds `e.message` from `error.message`, not
+    // `error.type`); `stream_error` has neither, so claude-code does NOT retry.
+    // This is the accepted cc-switch trade-off: recovery is meant to come from
+    // the pre-commit path (a real HTTP 429/5xx status), not from retrying a
+    // partially-streamed turn.
     expect(eventTypes).toContain("error");
     const errorEvents = events.filter((e) => e.event === "error");
     expect(errorEvents.length).toBeGreaterThan(0);
-    expect(errorEvents.some((e) => e.data.includes('"type":"api_error"'))).toBe(true);
-    expect(errorEvents.some((e) => e.data.includes("Upstream stream read error"))).toBe(true);
-    expect(errorEvents.some((e) => e.data.includes("Connection reset by peer"))).toBe(true);
+    const parsed = JSON.parse(errorEvents[0].data);
+    expect(parsed.error.type).toBe("stream_error");
+    // cc-switch's mid-stream type — NOT overloaded_error, and the message MUST
+    // NOT carry the '"type":"overloaded_error"' substring (that would trigger an
+    // unwanted client retry of a partially-streamed turn).
+    expect(parsed.error.message).toContain("Upstream stream read error");
+    expect(parsed.error.message).toContain("Connection reset by peer");
+    expect(parsed.error.message).not.toContain('"type":"overloaded_error"');
 
     // CRITICAL: the error must NOT be disguised as assistant text content. The
     // original pre-78484ae bug wrapped the error message in a `text` content
@@ -432,8 +446,10 @@ describe("SSE stream forwarding", () => {
     expect(body).not.toMatch(/text_delta[^}]*Connection reset by peer/);
 
     // And the message must NOT be falsely reported as a successful turn. After
-    // the error there must be no message_delta / message_stop / [DONE] — the
-    // client retries the whole turn, it does not persist a failed/partial one.
+    // the error there must be no message_delta / message_stop / [DONE] — the SDK
+    // throws on the error event and discards the partial, so no failed/partial
+    // turn is persisted into conversation history (no poisoning). By design the
+    // client does NOT retry a partially-streamed turn (cc-switch trade-off).
     expect(eventTypes).not.toContain("message_delta");
     expect(eventTypes).not.toContain("message_stop");
     expect(body).not.toContain("[DONE]");
@@ -446,8 +462,8 @@ describe("SSE stream forwarding", () => {
   //         — it must complete the turn gracefully (message_delta +
   //         message_stop), NOT be treated as a connection abort. This is the
   //         counterpart to Bug 4: abort = no finish_reason AND no `[DONE]`
-  //         (→ event:error → retry); [DONE] = no finish_reason BUT `[DONE]`
-  //         present (→ complete normally, no retry).
+  //         (→ event:error, stream_error, no client retry); [DONE] = no
+  //         finish_reason BUT `[DONE]` present (→ complete normally, no retry).
   // -----------------------------------------------------------------------
 
   it("treats [DONE] without finish_reason as graceful completion, not an abort", async () => {
@@ -723,10 +739,11 @@ describe("SSE stream forwarding", () => {
       expect(res.status).toBe(200);
 
       // Read the full response — the upstream abort surfaces as an explicit
-      // `event: error` (api_error), and finalizeDump must still run.
+      // `event: error` (cc-switch-style stream_error, no client retry trigger),
+      // and finalizeDump must still run.
       const body = await collectResponseBody(res);
       expect(body).toContain("Upstream stream read error");
-      expect(body).toContain('"type":"api_error"');
+      expect(body).toContain('"type":"stream_error"');
 
       // Verify dump was finalized: directory renamed with __START_ and __END_
       const { readdirSync } = await import("node:fs");
