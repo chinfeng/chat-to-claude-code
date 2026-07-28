@@ -1,7 +1,7 @@
 /** OpenAI-style chat transport: streams /chat/completions upstream, emits Anthropic SSE downstream. */
 
 import { randomUUID } from "crypto";
-import { SSEBuilder, mapStopReason, mapErrorType, DEFAULT_PING_INTERVAL_MS } from "../sse/builder.js";
+import { SSEBuilder, mapStopReason, mapErrorType } from "../sse/builder.js";
 import type { UsageInfo } from "../sse/builder.js";
 import { ThinkTagParser, ContentType, HeuristicToolParser } from "../parsers/index.js";
 import type { RequestData } from "../conversion/converter.js";
@@ -16,6 +16,18 @@ export class UpstreamStreamError extends Error {
     this.name = "UpstreamStreamError";
     this.code = code;
   }
+}
+
+/** Detect which stop sequence (if any) the accumulated text ends with.
+ *  Some upstream APIs strip stop sequences from the output; this detection
+ *  only fires when the upstream does NOT strip them. When the upstream has
+ *  already stripped the sequence, returns null — the original behavior. */
+function detectStopSequence(text: string, sequences: readonly string[] | null | undefined): string | null {
+  if (!sequences?.length || !text) return null;
+  for (const seq of sequences) {
+    if (seq && text.endsWith(seq)) return seq;
+  }
+  return null;
 }
 
 /**
@@ -195,22 +207,6 @@ export async function* streamOpenAIChatToAnthropicSse(
   const messageId = `msg_${randomUUID()}`;
   const thinkingEnabled = isThinkingEnabled(request, thinkingEnabledHint);
 
-  // ---- ping heartbeat timer ----
-  let pingTimer: ReturnType<typeof setInterval> | null = null;
-  const pingStart = (): void => {
-    if (pingTimer) return;
-    pingTimer = setInterval(() => {
-      // Pings are injected by the route layer via a side-channel
-      // (see routes.ts `handleMessages` ReadableStream start() which
-      //  reads ssePingCallback below). This timer is a fall-back that
-      //  enqueues a ping into the stream output when the route layer's
-      //  own interval is not active.
-    }, DEFAULT_PING_INTERVAL_MS);
-  };
-  const pingStop = (): void => {
-    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-  };
-
   let firstUsageInfo: UsageInfo | null = null;
   // Set when the upstream sent the OpenAI stream-end marker `data: [DONE]` (surfaced
   // as the `{ __sseDone: true }` sentinel by parseSseLine in routes.ts). When set
@@ -242,9 +238,6 @@ export async function* streamOpenAIChatToAnthropicSse(
   const toolArgAccum: Map<number, string> = new Map();
 
   try {
-    // Start ping timer after message_start
-    pingStart();
-
     for await (const chunk of upstreamStream) {
       // OpenAI stream-end marker: `[DONE]` is an explicit completion signal even
       // when no `finish_reason` chunk arrived (some providers emit `[DONE]`
@@ -374,7 +367,6 @@ export async function* streamOpenAIChatToAnthropicSse(
       }
     }
   } catch (e) {
-    pingStop();
     // Close any content blocks opened so far so the downstream prefix is
     // well-formed up to the failure point, then rethrow: the route layer emits a
     // top-level `event: error` (retryable, e.g. api_error) — for BOTH an
@@ -389,8 +381,6 @@ export async function* streamOpenAIChatToAnthropicSse(
     // read-error handling.
     for (const event of sse.close_all_blocks()) yield event;
     throw e;
-  } finally {
-    pingStop();
   }
 
   // Flush remaining content
@@ -477,8 +467,12 @@ export async function* streamOpenAIChatToAnthropicSse(
 
   const effectiveFinishReason = hasOrphanedToolStates ? "stop" : finishReason;
 
+  // Detect matching stop sequence from accumulated text (best-effort —
+  // upstream APIs often strip stop sequences, in which case this returns null).
+  const detectedStopSeq = detectStopSequence(sse.accumulated_text, request.stop_sequences);
+
   if (!options?.skipMessageLifecycle) {
-    yield sse.message_delta(mapStopReason(effectiveFinishReason), completion);
+    yield sse.message_delta(mapStopReason(effectiveFinishReason), completion, detectedStopSeq);
     yield sse.message_stop();
   }
 }

@@ -11,6 +11,11 @@ export const ANTHROPIC_SSE_RESPONSE_HEADERS: Record<string, string> = {
 /** Default interval between `event: ping` heartbeat events (ms). */
 export const DEFAULT_PING_INTERVAL_MS = 15_000;
 
+/** Pre-built `event: ping` SSE event string (Anthropic keep-alive).
+ *  Heartbeat pings are emitted by the route layer at the interval above;
+ *  the stream generator does NOT produce pings — it only handles content. */
+export const PING_EVENT = "event: ping\ndata: {}\n\n";
+
 const STOP_REASON_MAP: Record<string, string> = {
   stop: "end_turn",
   length: "max_tokens",
@@ -277,7 +282,7 @@ export class SSEBuilder {
     });
   }
 
-  message_delta(stopReason: string, outputTokens: number | null): string {
+  message_delta(stopReason: string, outputTokens: number | null, stopSequence: string | null = null): string {
     // message_delta is emitted at stream end, after a usage chunk has arrived
     // (when stream_options.include_usage was requested): report the REAL input
     // token count (prompt_tokens minus cache buckets) instead of the
@@ -288,6 +293,10 @@ export class SSEBuilder {
       input_tokens: safeIn,
       output_tokens: safeOut,
     };
+    const thinkingTokens = this.estimateThinkingTokens();
+    if (thinkingTokens > 0) {
+      usage.thinking_tokens = thinkingTokens;
+    }
     if (this._usageInfo?.cache_read_input_tokens && this._usageInfo.cache_read_input_tokens > 0) {
       usage.cache_read_input_tokens = this._usageInfo.cache_read_input_tokens;
     }
@@ -296,7 +305,7 @@ export class SSEBuilder {
     }
     return formatSseEvent("message_delta", {
       type: "message_delta",
-      delta: { stop_reason: stopReason, stop_sequence: null },
+      delta: { stop_reason: stopReason, stop_sequence: stopSequence ?? null },
       usage,
     });
   }
@@ -339,7 +348,7 @@ export class SSEBuilder {
     });
   }
 
-  content_block_delta(index: number, deltaType: string, content: string): string {
+  content_block_delta(index: number, deltaType: string, content: string, citations?: Record<string, unknown>[] | null): string {
     const delta: Record<string, unknown> = { type: deltaType };
     if (deltaType === "thinking_delta") {
       delta.thinking = content;
@@ -347,6 +356,11 @@ export class SSEBuilder {
       delta.signature = content;
     } else if (deltaType === "text_delta") {
       delta.text = content;
+      // Anthropic `citations` array on text_delta — source-grounded references
+      // (char_location, page_location, etc.) that accompany the text payload.
+      if (citations && citations.length > 0) {
+        delta.citations = citations;
+      }
     } else if (deltaType === "input_json_delta") {
       delta.partial_json = content;
     }
@@ -554,5 +568,15 @@ export class SSEBuilder {
     const blockCount =
       (accReasoning ? 1 : 0) + (accText ? 1 : 0) + startedToolCount;
     return textTokens + reasoningTokens + toolTokens + blockCount * 4;
+  }
+
+  /** Estimate the number of tokens consumed by thinking content only.
+   *  Uses the same char/4 heuristic as `estimate_output_tokens()`.
+   *  For the `thinking-token-count-2026-05-13` beta: this count is
+   *  included in `message_delta` usage as `thinking_tokens`, a sub-count
+   *  of the total `output_tokens`. */
+  estimateThinkingTokens(): number {
+    const accReasoning = this.accumulated_reasoning;
+    return Math.ceil(accReasoning.length / 4);
   }
 }

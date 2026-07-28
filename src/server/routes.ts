@@ -10,7 +10,7 @@ import { invalidRequestError, authenticationError, upstreamError, serverError } 
 import type { ServerConfig, ServerToolConfig } from "./config.js";
 import { resolveModelExtra, deepMerge } from "./config.js";
 import { prepareCanonicalBody } from "../conversion/canonical.js";
-import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder, buildMidStreamErrorSse, DEFAULT_PING_INTERVAL_MS } from "../sse/builder.js";
+import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder, buildMidStreamErrorSse, DEFAULT_PING_INTERVAL_MS, PING_EVENT } from "../sse/builder.js";
 import { createDumpSession, type DumpTermination, type TerminationReason, type ServerToolLogEntry } from "../core/dump.js";
 import {
   isServerToolType,
@@ -593,6 +593,16 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
   const encoder = new TextEncoder();
   const readable = new ReadableStream({
     async start(controller) {
+      // Start ping heartbeat to keep long-lived connections alive (Anthropic
+      // keep-alive). The stream generator does NOT emit pings — the route layer
+      // handles them directly via the controller so pings interleave with content
+      // events without generator overhead.
+      const pingInterval = setInterval(() => {
+        if (!downstreamAborted) {
+          try { controller.enqueue(encoder.encode(PING_EVENT)); } catch { /* stream closed */ }
+        }
+      }, DEFAULT_PING_INTERVAL_MS);
+
       // Fire-and-forget: start the SSE pump AFTER start() resolves so the
       // stream is "started" and the controller respects backpressure from
       // downstream pulls. Running the for-await loop directly inside
@@ -636,6 +646,7 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
             }
           }
         } finally {
+          clearInterval(pingInterval);
           finalizeDump();
           try { controller.close(); } catch { /* already closed by cancel */ }
         }
@@ -1036,6 +1047,11 @@ async function handleServerToolRequest(
       async start(controller) {
         const downstreamChunks: string[] = [];
 
+        // Start ping heartbeat for the agentic-loop stream as well.
+        const pingInterval = setInterval(() => {
+          try { controller.enqueue(encoder.encode(PING_EVENT)); } catch { /* stream closed */ }
+        }, DEFAULT_PING_INTERVAL_MS);
+
         function emit(event: string) {
           downstreamChunks.push(event);
           controller.enqueue(encoder.encode(event));
@@ -1164,6 +1180,7 @@ async function handleServerToolRequest(
                     termination: { reason: "upstream_abort", disconnectTime: new Date().toISOString() },
                 });
             } finally {
+                clearInterval(pingInterval);
                 dump.finish();
                 try { controller.close(); } catch {}
             }

@@ -190,16 +190,23 @@ function deferredPostToolBlocks(content: ContentBlock[], firstToolIndex: number)
   );
 }
 
-function assertNoForbiddenAssistantBlock(block: ContentBlock): void {
+/** Check for forbidden assistant content blocks that need graceful degradation.
+ *  Returns a text placeholder for blocks that are tolerated but not natively
+ *  supported by OpenAI Chat format (e.g. images → "[Image]"), or null if the
+ *  block is safe to skip silently (server_tool_use, etc.). Only throws for truly
+ *  unsupported block types that cannot be mapped at all. */
+function assertNoForbiddenAssistantBlock(block: ContentBlock): string | null {
   const blockType = getBlockType(block);
   if (blockType === "image") {
-    throw new OpenAIConversionError(
-      "Assistant image blocks are not supported for OpenAI chat conversion.",
-    );
+    // OpenAI Chat does not support image blocks in assistant messages.
+    // Degrade gracefully: insert a text placeholder so conversation flow
+    // is preserved and the user knows an image was present.
+    return "[Image]";
   }
   // server_tool_use, web_search_tool_result, web_fetch_tool_result are handled
   // separately by server tool injection — they are not forbidden, just skipped
   // in normal conversion since they're proxy-side only.
+  return null;
 }
 
 /** Check if a block type is a tool-result-like block that should be serialized
@@ -275,7 +282,8 @@ function _convertAssistantMessage(
         },
       });
     } else {
-      assertNoForbiddenAssistantBlock(block);
+      const placeholder = assertNoForbiddenAssistantBlock(block);
+      if (placeholder) contentParts.push(placeholder);
     }
   }
 
@@ -389,17 +397,19 @@ function _convertUserMessageWithInjection(
     } else if (isToolResultBlockType(blockType)) {
       flushText();
       const toolContent = getBlockAttr(block, "content", "");
+      const isError = getBlockAttr(block, "is_error") === true;
       const { text, images } = serializeToolResultContent(toolContent);
       const tuid = getBlockAttr(block, "tool_use_id");
       const tuidS = tuid !== null && tuid !== undefined ? String(tuid) : "";
       const toolText = images.length
         ? `${text}${text ? "\n" : ""}${TOOL_RESULT_MEDIA_MARKER}`
         : text;
+      const finalContent = (isError ? "[TOOL_ERROR] " : "") + (toolText || "");
 
       result.push({
         role: "tool",
         tool_call_id: tuid,
-        content: toolText || "",
+        content: finalContent,
       });
       if (images.length) toolMedia.push(...images);
 
@@ -478,24 +488,44 @@ function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[]
       const part = buildImagePartFromBlock(block);
       if (part) imageParts.push(part);
     } else if (blockType === "document") {
-      // Anthropic document blocks carry PDFs/other media. OpenAI Chat
-      // has no native "document" content part type. We serialize a text
-      // summary (filename + media type) so the upstream knows about the
-      // document, but the binary data itself is not carried through.
+      // Anthropic document blocks carry PDFs/images/other media. OpenAI Chat
+      // has no native "document" content part type. Strategy:
+      //   - base64 image documents → image_url content part (preserves binary data)
+      //   - base64 non-image documents → text reference with data URL (preserves data)
+      //   - url documents → text reference with URL (existing behavior)
       const source = getBlockAttr(block, "source", {}) as Record<string, unknown>;
       const title = String(getBlockAttr(block, "title", "") ?? "");
       const context = String(getBlockAttr(block, "context", "") ?? "");
       if (source && typeof source === "object") {
         const sourceType = String(source.type ?? "");
-        const mediaType = String(source.media_type ?? "");
-        const filename = title || (sourceType === "url" ? String(source.url ?? "") : "document");
-        const desc = mediaType ? `${filename} (${mediaType})` : filename;
-        textParts.push(context ? `[Document: ${desc}]\n${context}` : `[Document: ${desc}]`);
+        const mediaType = String(source.media_type ?? source.mime_type ?? "");
+        if (sourceType === "base64" && isImageMimeType(mediaType)) {
+          // Image document → convert to image_url content part
+          const data = String(source.data ?? "");
+          if (data) {
+            flushText();
+            const url = data.startsWith("data:") ? data : `data:${mediaType};base64,${data}`;
+            imageParts.push({ type: "image_url", image_url: { url } });
+          }
+        } else if (sourceType === "base64") {
+          // Non-image binary document → include data URL in text reference
+          const data = String(source.data ?? "");
+          const filename = title || "document";
+          const dataUrl = data ? `data:${mediaType};base64,${data}` : mediaType;
+          const desc = `${filename} (${dataUrl})`;
+          textParts.push(context ? `[Document: ${desc}]\n${context}` : `[Document: ${desc}]`);
+        } else {
+          // URL source → existing behavior
+          const filename = title || (sourceType === "url" ? String(source.url ?? "") : "document");
+          const desc = mediaType ? `${filename} (${mediaType})` : filename;
+          textParts.push(context ? `[Document: ${desc}]\n${context}` : `[Document: ${desc}]`);
+        }
       }
     } else if (isToolResultBlockType(blockType)) {
       flushImages();
       flushText();
       const toolContent = getBlockAttr(block, "content", "");
+      const isError = getBlockAttr(block, "is_error") === true;
       const { text, images } = serializeToolResultContent(toolContent);
       const toolText = images.length
         ? `${text}${text ? "\n" : ""}${TOOL_RESULT_MEDIA_MARKER}`
@@ -503,7 +533,7 @@ function _convertUserMessage(content: ContentBlock[]): Record<string, unknown>[]
       result.push({
         role: "tool",
         tool_call_id: getBlockAttr(block, "tool_use_id"),
-        content: toolText || "",
+        content: (isError ? "[TOOL_ERROR] " : "") + (toolText || ""),
       });
       if (images.length) toolMedia.push(...images);
     }
