@@ -10,7 +10,7 @@ import { invalidRequestError, authenticationError, upstreamError, serverError } 
 import type { ServerConfig, ServerToolConfig } from "./config.js";
 import { resolveModelExtra, deepMerge } from "./config.js";
 import { prepareCanonicalBody } from "../conversion/canonical.js";
-import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder, buildMidStreamErrorSse, DEFAULT_PING_INTERVAL_MS, PING_EVENT } from "../sse/builder.js";
+import { ANTHROPIC_SSE_RESPONSE_HEADERS, SSEBuilder, buildMidStreamErrorSse, buildRetryableMidStreamErrorSse, DEFAULT_PING_INTERVAL_MS, PING_EVENT } from "../sse/builder.js";
 import { createDumpSession, type DumpTermination, type TerminationReason, type ServerToolLogEntry } from "../core/dump.js";
 import {
   isServerToolType,
@@ -628,19 +628,24 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
               // fake message_stop either: that would persist a failed/partial
               // turn into conversation history (the original pre-78484ae bug).
               //
-              // We emit the cc-switch-aligned mid-stream error shape:
-              // `error.type = "stream_error"` with the descriptive upstream
-              // failure message, and NO message_delta/message_stop. claude-code's
-              // retry predicate `sym` only fires on HTTP 429/5xx (impossible
-              // mid-stream — 200 is already committed) or the literal substring
-              // `'"type":"overloaded_error"'` inside `e.message`; we emit neither,
-              // so claude-code does NOT retry. This is the accepted cc-switch
-              // trade-off: post-commit mid-stream aborts are surfaced (not
-              // retried), and recovery is meant to come from the PRE-commit path
-              // (a real HTTP 429/5xx status via `upstreamError(..., mappedStatus)`),
-              // which this proxy already exposes. See buildMidStreamErrorSse.
+              // We emit `error.type = "stream_error"` with the descriptive
+              // upstream failure message, and NO message_delta/message_stop (the
+              // partial is discarded, no history poisoning). The retry decision
+              // splits by abort kind:
+              //  - UpstreamAbortedError (connection reset / clean EOF, no
+              //    finish_reason): occassional-network-jitter shape → embed the
+              //    `'"type":"overloaded_error"'` substring into the message so
+              //    claude-code's `sym` retries the turn (our single-upstream
+              //    substitute for cc-switch's pre-commit failover).
+              //  - UpstreamStreamError (upstream embedded an explicit error object,
+              //    often 429/529/api_error): no retry — retrying a self-reported
+              //    overload just re-hits it (matches cc-switch's post-commit
+              //    behaviour).
+              // See buildRetryableMidStreamErrorSse / buildMidStreamErrorSse.
               const msg = e instanceof Error ? e.message : String(e);
-              const errLine = buildMidStreamErrorSse(msg);
+              const errLine = e instanceof UpstreamAbortedError
+                ? buildRetryableMidStreamErrorSse(msg)
+                : buildMidStreamErrorSse(msg);
               downstreamChunks.push(errLine);
               try { controller.enqueue(encoder.encode(errLine)); } catch { /* stream already closed */ }
             }
@@ -1162,15 +1167,22 @@ async function handleServerToolRequest(
                 dump.setTiming({ ttfb: Date.now() - requestStartMs, totalTime: Date.now() - requestStartMs });
             } catch (e) {
                 if (!abortSignal?.aborted) {
-                    // Same cc-switch-aligned mid-stream `event: error` handling
-                    // as the standard flow catch (see there for rationale): emit
-                    // `error.type = "stream_error"` with the descriptive upstream
-                    // message, NO `overloaded_error`/substring and NO
-                    // message_delta/message_stop — so the partial is discarded
-                    // (no history poisoning) and claude-code does NOT retry a
-                    // partially-streamed turn (the accepted cc-switch trade-off).
+                    // Same mid-stream `event: error` handling as the standard
+                    // flow catch (see there for rationale): emit `error.type =
+                    // "stream_error"` with the descriptive upstream message, and
+                    // NO message_delta/message_stop (partial discarded, no history
+                    // poisoning). Retry split by abort kind:
+                    //  - UpstreamAbortedError (reset / clean EOF): embed the
+                    //    `'"type":"overloaded_error"'` substring → claude-code
+                    //    retries the turn (our single-upstream substitute for
+                    //    cc-switch's pre-commit failover).
+                    //  - UpstreamStreamError (upstream embedded an explicit error,
+                    //    often 429/529/api_error): no retry.
+                    // See buildRetryableMidStreamErrorSse / buildMidStreamErrorSse.
                     const msg = e instanceof Error ? e.message : String(e);
-                    const errLine = buildMidStreamErrorSse(msg);
+                    const errLine = e instanceof UpstreamAbortedError
+                        ? buildRetryableMidStreamErrorSse(msg)
+                        : buildMidStreamErrorSse(msg);
                     try { emit(errLine); } catch { /* stream closed */ }
                 }
                 dump.writeDownstreamResponse({

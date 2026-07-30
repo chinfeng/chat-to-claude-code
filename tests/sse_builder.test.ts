@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { SSEBuilder, ContentBlockManager, formatSseEvent, mapStopReason } from "../src/sse/builder.js";
+import { SSEBuilder, ContentBlockManager, formatSseEvent, mapStopReason, buildMidStreamErrorSse, buildRetryableMidStreamErrorSse } from "../src/sse/builder.js";
 
 describe("formatSseEvent", () => {
   it("formats a proper SSE event string", () => {
@@ -147,6 +147,33 @@ describe("SSEBuilder", () => {
     const event = sse.emit_top_level_error("Fatal");
     expect(event).toContain("event: error");
     expect(event).toContain("Fatal");
+  });
+
+  it("buildMidStreamErrorSse produces a non-retryable stream_error event", () => {
+    const event = buildMidStreamErrorSse("Upstream stream read error: Connection reset by peer");
+    const dataLine = event.split("\n").find((l) => l.startsWith("data: "))!.slice("data: ".length);
+    const parsed = JSON.parse(dataLine);
+    expect(parsed.type).toBe("error");
+    expect(parsed.error.type).toBe("stream_error");
+    expect(parsed.error.message).toBe("Upstream stream read error: Connection reset by peer");
+    // No overloaded_error substring → does NOT trigger a claude-code mid-stream
+    // retry (used for UpstreamStreamError — upstream embedded an explicit error).
+    expect(parsed.error.message).not.toContain('"type":"overloaded_error"');
+  });
+
+  it("buildRetryableMidStreamErrorSse triggers a claude-code mid-stream retry", () => {
+    const event = buildRetryableMidStreamErrorSse("Upstream stream read error: Connection reset by peer");
+    const dataLine = event.split("\n").find((l) => l.startsWith("data: "))!.slice("data: ".length);
+    const parsed = JSON.parse(dataLine);
+    expect(parsed.type).toBe("error");
+    // error.type stays stream_error (true root cause = connection abort, not a real 529).
+    expect(parsed.error.type).toBe("stream_error");
+    // The overloaded_error substring lives INSIDE error.message (where the SDK puts
+    // e.message, and where claude-code's `sym` |includes| match fires) — the retry trigger.
+    expect(parsed.error.message).toContain('"type":"overloaded_error"');
+    // The real upstream reason stays human-readable behind the JSON prefix.
+    expect(parsed.error.message).toContain("Upstream stream read error");
+    expect(parsed.error.message).toContain("Connection reset by peer");
   });
 
   it("emit_server_tool_use produces server_tool_use block", () => {

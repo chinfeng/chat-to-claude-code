@@ -63,12 +63,52 @@ export function mapErrorType(
  *  HTTP-status retry trigger when a request fails BEFORE any SSE is sent (the
  *  pre-commit path this proxy already exposes via `upstreamError(..., mappedStatus)`).
  *  Post-commit, cc-switch surfaces `stream_error` and lets the client not retry —
- *  the trade-off this proxy now matches.
+ *  the trade-off reflected here for `UpstreamStreamError` (upstream embedded an
+ *  explicit error object, often 429/529/api_error — retrying a self-reported
+ *  overload just re-hits the same error). See `buildRetryableMidStreamErrorSse`
+ *  for the connection-abort path, which DOES trigger a client retry.
  */
 export function buildMidStreamErrorSse(message: string): string {
   return formatSseEvent("error", {
     type: "error",
     error: { type: "stream_error", message },
+  });
+}
+
+/** Build a `stream_error`-flavoured mid-stream `event: error` that DOES trigger
+ *  a claude-code client retry, for upstream CONNECTION aborts (reset / clean EOF
+ *  with no `finish_reason`) — modeled as occassional network jitter worth a
+ *  transparent retry.
+ *
+ *  claude-code's mid-stream retry predicate `sym` fires on HTTP 429/5xx
+ *  (impossible mid-stream — 200 is already committed) OR the literal substring
+ *  `'"type":"overloaded_error"'` inside `e.message` (the SDK builds `e.message`
+ *  from `body.error.message`, not `error.type`). We deliberately do NOT promote
+ *  `error.type` to `overloaded_error` (keep `stream_error` so dumps/logs still
+ *  show the true root cause — a connection abort, not a real 529). Instead we
+ *  embed the substring into `error.message` as a prefix:
+ *    `{"type":"overloaded_error"} <real upstream message>`
+ *  The SDK surfaces `e.message` verbatim as `API Error: <message>`, so the human
+ *  still reads the real upstream reason behind the small JSON prefix; `sym`'s
+ *  substring match hits on the prefix and claude-code retries the turn (the SDK
+ *  discards the already-streamed `message_start`/thinking partial — no history
+ *  poisoning; we still emit NO `message_delta`/`message_stop`).
+ *
+ *  This is the deliberate divergence from cc-switch: cc-switch recovers from a
+ *  post-commit abort by transparent pre-commit failover to another provider (a
+ *  `prime_streaming_response` first-byte gate), which a single-upstream proxy
+ *  cannot do — so we lean on the client-retry hatch instead. Risk: the upstream
+ *  just dropped, so an immediate retry may drop again; claude-code's internal
+ *  retry/backoff caps bound it. Inputs fed back are unchanged (only the turn is
+ *  re-run), so a retry stays benign.
+ */
+export function buildRetryableMidStreamErrorSse(message: string): string {
+  return formatSseEvent("error", {
+    type: "error",
+    error: {
+      type: "stream_error",
+      message: `{"type":"overloaded_error"} ${message}`,
+    },
   });
 }
 
