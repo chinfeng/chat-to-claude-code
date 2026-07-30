@@ -966,7 +966,7 @@ describe("SSE stream forwarding", () => {
     let capturedBody: string | undefined;
     const original = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      capturedBody = typeof init?.body === "string" ? init.body : String(init?.body ?? "");
+      capturedBody = input instanceof Request ? await input.clone().text() : "";
       const body = textToReadableStream(typicalUpstreamSse());
       return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
     }) as typeof fetch;
@@ -992,8 +992,8 @@ describe("SSE stream forwarding", () => {
     };
     let capturedBody: string | undefined;
     const original = globalThis.fetch;
-    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-      capturedBody = typeof init?.body === "string" ? init.body : String(init?.body ?? "");
+    globalThis.fetch = (async (input: RequestInfo | URL, _init?: RequestInit) => {
+      capturedBody = input instanceof Request ? await input.clone().text() : "";
       const body = textToReadableStream(typicalUpstreamSse());
       return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
     }) as typeof fetch;
@@ -1026,8 +1026,8 @@ describe("SSE stream forwarding", () => {
     });
     let capturedBody: string | undefined;
     const original = globalThis.fetch;
-    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-      capturedBody = typeof init?.body === "string" ? init.body : String(init?.body ?? "");
+    globalThis.fetch = (async (input: RequestInfo | URL, _init?: RequestInit) => {
+      capturedBody = input instanceof Request ? await input.clone().text() : "";
       const body = textToReadableStream(typicalUpstreamSse());
       return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
     }) as typeof fetch;

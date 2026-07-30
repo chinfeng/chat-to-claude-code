@@ -28,12 +28,14 @@ function toolInputSchema(tool: Record<string, unknown>): Record<string, unknown>
   return { type: "object", properties: {} };
 }
 
-/** Remove the single line terminator (\r\n | \r | \n) starting at fromIndex. */
+/** Remove the leading segment through (and including) the line terminator
+ *  at fromIndex.  For "\r\n" the terminator is two chars; for "\r" or "\n"
+ *  it is one char.  Returns everything AFTER the terminator. */
 function stripTrailingNewline(text: string, fromIndex: number): string {
   if (text[fromIndex] === "\r" && text[fromIndex + 1] === "\n") {
-    return text.slice(0, fromIndex) + text.slice(fromIndex + 2);
+    return text.slice(fromIndex + 2);
   }
-  return text.slice(0, fromIndex) + text.slice(fromIndex + 1);
+  return text.slice(fromIndex + 1);
 }
 
 /** Strip a leading `x-anthropic-billing-header: <value>` line from a system
