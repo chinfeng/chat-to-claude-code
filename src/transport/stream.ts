@@ -69,10 +69,37 @@ function detectStopSequence(text: string, sequences: readonly string[] | null | 
  * re-hits the same error.
  */
 export class UpstreamAbortedError extends Error {
-  constructor(message: string) {
+  readonly subtype: 'connection_closed' | 'response_stalled';
+
+  constructor(message: string, subtype: 'connection_closed' | 'response_stalled' = 'response_stalled') {
     super(message);
     this.name = "UpstreamAbortedError";
+    this.subtype = subtype;
   }
+}
+
+/** Build the Claude-standard incomplete-notice text appended when a streaming
+ *  request fails mid-response AFTER the upstream has started producing output.
+ *  Mirrors https://code.claude.com/docs/en/errors#the-response-above-may-be-incomplete:
+ *
+ *    API Error: Server error mid-response. The response above may be incomplete.
+ *    API Error: Connection closed mid-response. The response above may be incomplete.
+ *    API Error: Response stalled mid-stream. The response above may be incomplete.
+ *
+ *  When no output was produced yet, this notice is NOT used — the error surfaces
+ *  as a top-level `event: error` instead. */
+export function buildIncompleteNotice(e: unknown): string {
+  if (e instanceof UpstreamStreamError) {
+    return "\n\nAPI Error: Server error mid-response. The response above may be incomplete.";
+  }
+  if (e instanceof UpstreamAbortedError) {
+    if (e.subtype === 'connection_closed') {
+      return "\n\nAPI Error: Connection closed mid-response. The response above may be incomplete.";
+    }
+    return "\n\nAPI Error: Response stalled mid-stream. The response above may be incomplete.";
+  }
+  // Fallback for unknown errors
+  return "\n\nAPI Error: Response stalled mid-stream. The response above may be incomplete.";
 }
 
 export interface StreamChunk {
@@ -359,43 +386,95 @@ export async function* streamOpenAIChatToAnthropicSse(
     //     abort/retry. Matches cc-switch's [DONE] handling.
     //  2. No [DONE], no finish_reason: the upstream terminated without
     //     completing (clean TCP close after the last chunk, or — via
-    //     iterUpstreamChunks — a socket reset/abort). This is a connection
-    //     abort: throw UpstreamAbortedError so the route layer emits a
-    //     retryable top-level `event: error` (stream_error flavour that embeds
-    //     the overloaded_error substring into the message, triggering a
-    //     claude-code retry — our single-upstream substitute for cc-switch's
-    //     pre-commit failover; see buildRetryableMidStreamErrorSse) — never a
-    //     self-defined finish_reason/message_stop (that would disguise a failure
-    //     as a completed turn and poison history), and never an abrupt close
-    //     (which claude-code reports as "empty or malformed response
-    //     (HTTP 200)" and does not retry).
+    //     iterUpstreamChunks — a socket reset/abort). Throw
+    //     UpstreamAbortedError with 'response_stalled' subtype; the catch block
+    //     below either appends a Claude-standard incomplete notice when output
+    //     was already produced, or re-throws so the route layer emits a
+    //     retryable top-level `event: error` when nothing was emitted yet.
     if (finishReason == null) {
       if (seenDone) {
         finishReason = "stop";
       } else {
         throw new UpstreamAbortedError(
           "Upstream stream ended without a finish_reason (connection terminated mid-generation).",
+          'response_stalled',
         );
       }
     }
   } catch (e) {
+    // Flush any buffered parser content BEFORE checking hadContent. The
+    // heuristic parser buffers text until flush(); text that's been received
+    // from the upstream but not yet emitted would cause hadContent to be
+    // falsely negative, skipping the incomplete-notice path.
+    const remainingThink = thinkParser.flush();
+    if (remainingThink) {
+      if (remainingThink.type === ContentType.THINKING) {
+        if (thinkingEnabled) {
+          for (const event of sse.ensure_thinking_block()) yield event;
+          sse.addThinkingText(remainingThink.content);
+          yield sse.content_block_delta(sse.blocks.thinkingIndex, "thinking_delta", remainingThink.content);
+        }
+      } else {
+        for (const event of sse.ensure_text_block()) yield event;
+        yield sse.emit_text_delta(remainingThink.content);
+      }
+    }
+
+    const heuristicFlush = heuristicParser.flush();
+    if (heuristicFlush.text) {
+      for (const event of sse.ensure_text_block()) yield event;
+      yield sse.emit_text_delta(heuristicFlush.text);
+    }
+    for (const toolUse of heuristicFlush.tools) {
+      for (const event of iterHeuristicToolUseSse(sse, toolUse)) yield event;
+    }
+
     // Close any content blocks opened so far so the downstream prefix is
-    // well-formed up to the failure point, then rethrow: the route layer emits a
-    // top-level `event: error` with NO message_delta/message_stop (the partial
-    // is discarded, no history poisoning). The retry decision splits by abort
-    // kind — UpstreamAbortedError (connection drop) → buildRetryableMidStreamErrorSse
-    // (stream_error + overloaded_error substring in the message ⇒ claude-code
-    // retries the turn); UpstreamStreamError (upstream embedded an explicit error
-    // object, carries a code) → plain buildMidStreamErrorSse (non-retryable:
-    // retrying a self-reported overload/api_error just re-hits it). We
-    // deliberately do NOT wrap the error in a `text` content block and do NOT
-    // emit message_delta/message_stop: disguising a failure as a completed
-    // assistant turn poisons conversation history, while an abrupt close with
-    // no terminal marker makes claude-code report "empty or malformed response
-    // (HTTP 200)" and never retry. `event: error` is the only signal that avoids
-    // the malformed-response error; the overloaded_error substring additionally
-    // triggers a retry for the connection-abort kind.
+    // well-formed up to the failure point.
     for (const event of sse.close_all_blocks()) yield event;
+
+    // Check if the upstream had already started producing output before the
+    // failure. When output exists we align with Claude's standard behaviour
+    // (https://code.claude.com/docs/en/errors#the-response-above-may-be-incomplete):
+    // keep the partial output, append an incomplete-notice text block, and
+    // complete the turn normally (message_delta + message_stop) — the partial
+    // turn is preserved rather than discarded. When NO output was produced yet,
+    // keep the existing behaviour: re-throw so the route layer emits a top-level
+    // `event: error` (stream_error), which may embed the retry-trigger substring
+    // for connection-abort kinds.
+    const hadContent =
+      sse.accumulated_text.length > 0 ||
+      sse.accumulated_reasoning.length > 0 ||
+      sse.blocks.textStarted ||
+      sse.blocks.thinkingStarted ||
+      sse.blocks.hasEmittedToolBlock();
+
+    if (hadContent) {
+      // Append Claude-standard incomplete notice as a text content block.
+      const notice = buildIncompleteNotice(e);
+      for (const event of sse.ensure_text_block()) yield event;
+      yield sse.emit_text_delta(notice);
+      for (const event of sse.close_content_blocks()) yield event;
+
+      // Complete the turn — the partial output + notice is preserved.
+      const completion =
+        usageInfo && typeof usageInfo.completion_tokens === "number"
+          ? usageInfo.completion_tokens
+          : sse.estimate_output_tokens();
+      finishReason = finishReason || "stop";
+      if (!options?.skipMessageLifecycle) {
+        yield sse.message_delta(mapStopReason(finishReason), completion);
+        yield sse.message_stop();
+      }
+      return; // Exit generator — skip normal post-processing (no orphan repair, etc.)
+    }
+
+    // No output emitted yet — re-throw so the route layer emits a top-level
+    // `event: error`. For UpstreamAbortedError the route layer uses the
+    // retryable variant (overloaded_error substring → client retry); for
+    // UpstreamStreamError it uses the plain non-retryable variant. The retry
+    // logic in buildRetryableMidStreamErrorSse / buildMidStreamErrorSse is
+    // unchanged.
     throw e;
   }
 

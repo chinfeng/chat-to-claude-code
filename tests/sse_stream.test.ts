@@ -140,6 +140,62 @@ function mockFetchWithMidStreamError(
   }) as typeof fetch;
 }
 
+/** Mock fetch that delivers content chunks then errors the stream after a
+ *  small delay so the consumer has time to process the content first.
+ *  Uses synchronous start() + setTimeout error so the stream is immediately
+ *  readable; the consumer processes enqueued chunks before the error fires. */
+function mockFetchWithErrorAfterContent(
+  chunks: string[],
+  errorMessage: string,
+  delayMs = 10,
+): void {
+  globalThis.fetch = (() => {
+    const encoder = new TextEncoder();
+    const allData = chunks.join("");
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(allData));
+        // Error after a delay — the consumer reads data first, then the
+        // next read triggers the error (or a pending read rejects).
+        setTimeout(() => {
+          controller.error(new Error(errorMessage));
+        }, delayMs);
+      },
+    });
+    return Promise.resolve(
+      new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+  }) as typeof fetch;
+}
+
+/** Mock fetch that delivers content chunks then closes the stream cleanly
+ *  WITHOUT a finish_reason and WITHOUT [DONE]. Uses synchronous start() so
+ *  data is readable immediately; the clean close exercises the
+ *  "response_stalled" path when output was already emitted. */
+function mockFetchWithCleanEofAfterContent(
+  chunks: string[],
+): void {
+  globalThis.fetch = (() => {
+    const encoder = new TextEncoder();
+    const allData = chunks.join("");
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(allData));
+        controller.close();
+      },
+    });
+    return Promise.resolve(
+      new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+  }) as typeof fetch;
+}
+
 function restoreFetch(): void {
   globalThis.fetch = ORIGINAL_FETCH;
 }
@@ -391,12 +447,14 @@ describe("SSE stream forwarding", () => {
   // -----------------------------------------------------------------------
 
   it("surfaces an upstream connection abort as a stream_error SSE event that triggers a client retry", async () => {
+    // Prefix with empty delta — no content is emitted, so the error fires
+    // before any output, exercising the no-content re-throw path.
     const goodPrefix = sseData({
       id: "chatcmpl-err",
       object: "chat.completion.chunk",
       created: 1,
       model: "gpt-4o",
-      choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }],
+      choices: [{ index: 0, delta: {}, finish_reason: null }],
     });
 
     mockFetchWithMidStreamError(goodPrefix, "Connection reset by peer");
@@ -457,6 +515,124 @@ describe("SSE stream forwarding", () => {
     expect(eventTypes).not.toContain("message_delta");
     expect(eventTypes).not.toContain("message_stop");
     expect(body).not.toContain("[DONE]");
+  });
+
+  // -----------------------------------------------------------------------
+  // Mid-stream error WITH prior output: Claude standard behaviour
+  // (https://code.claude.com/docs/en/errors#the-response-above-may-be-incomplete)
+  // keeps the partial output and appends an incomplete-notice text block
+  // instead of discarding the turn. The turn completes normally with
+  // message_delta + message_stop so the partial is preserved in history.
+  // -----------------------------------------------------------------------
+
+  it("appends incomplete notice when connection drops after output has started", async () => {
+    // Deliver text content, then simulate a connection reset
+    mockFetchWithErrorAfterContent(
+      [
+        sseData({
+          id: "chatcmpl-conn",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-4o",
+          choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: null }],
+        }),
+      ],
+      "Connection reset by peer",
+    );
+
+    const res = await routeRequest(makeMessagesRequest(), TEST_CONFIG);
+    expect(res.status).toBe(200);
+
+    const body = await collectResponseBody(res);
+    const events = parseSseResponse(body);
+    const eventTypes = events.map((e) => e.event);
+
+    // Content was emitted before the error
+    expect(body).toContain("Hello");
+
+    // The incomplete notice is appended as text
+    expect(body).toContain("API Error: Connection closed mid-response. The response above may be incomplete.");
+
+    // The turn completes normally — partial output preserved
+    expect(eventTypes).toContain("message_start");
+    expect(eventTypes).toContain("message_delta");
+    expect(eventTypes).toContain("message_stop");
+
+    // No top-level error event (failure is surfaced as the notice text, not
+    // as an error that discards the partial turn)
+    expect(eventTypes).not.toContain("error");
+  });
+
+  it("appends incomplete notice when upstream embeds an error object after output has started", async () => {
+    // Deliver text content, then an error object (server error mid-response)
+    const sseBody = [
+      sseData({
+        id: "chatcmpl-err",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta: { content: "partial output" }, finish_reason: null }],
+      }),
+      sseData({
+        id: "chatcmpl-err",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        error: { message: "Server overloaded", code: 529 },
+        choices: [],
+      }),
+    ].join("");
+
+    mockFetchWithSse(sseBody);
+
+    const res = await routeRequest(makeMessagesRequest(), TEST_CONFIG);
+    expect(res.status).toBe(200);
+
+    const body = await collectResponseBody(res);
+    const events = parseSseResponse(body);
+    const eventTypes = events.map((e) => e.event);
+
+    // Content was emitted before the error
+    expect(body).toContain("partial output");
+
+    // The incomplete notice is appended as text
+    expect(body).toContain("API Error: Server error mid-response. The response above may be incomplete.");
+
+    // Turn completes normally
+    expect(eventTypes).toContain("message_delta");
+    expect(eventTypes).toContain("message_stop");
+    expect(eventTypes).not.toContain("error");
+  });
+
+  it("appends incomplete notice when stream stalls after output has started", async () => {
+    // Deliver text content without finish_reason, then clean EOF (no [DONE])
+    mockFetchWithCleanEofAfterContent([
+      sseData({
+        id: "chatcmpl-stall",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta: { content: "stalled output" }, finish_reason: null }],
+      }),
+    ]);
+
+    const res = await routeRequest(makeMessagesRequest(), TEST_CONFIG);
+    expect(res.status).toBe(200);
+
+    const body = await collectResponseBody(res);
+    const events = parseSseResponse(body);
+    const eventTypes = events.map((e) => e.event);
+
+    // Content was emitted
+    expect(body).toContain("stalled output");
+
+    // Stalled-stream notice appended
+    expect(body).toContain("API Error: Response stalled mid-stream. The response above may be incomplete.");
+
+    // Turn completes normally — partial output preserved
+    expect(eventTypes).toContain("message_delta");
+    expect(eventTypes).toContain("message_stop");
+    expect(eventTypes).not.toContain("error");
   });
 
   // -----------------------------------------------------------------------
@@ -722,12 +898,14 @@ describe("SSE stream forwarding", () => {
   // -----------------------------------------------------------------------
 
   it("finalizes dump directory when upstream errors mid-stream", async () => {
+    // Empty delta — no content is emitted before the error, so the
+    // no-output re-throw path fires (event: error).
     const goodPrefix = sseData({
       id: "chatcmpl-dump-finalize",
       object: "chat.completion.chunk",
       created: 1,
       model: "gpt-4o",
-      choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }],
+      choices: [{ index: 0, delta: {}, finish_reason: null }],
     });
 
     mockFetchWithMidStreamError(goodPrefix, "Connection reset by peer");

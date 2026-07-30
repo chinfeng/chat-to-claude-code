@@ -151,9 +151,13 @@ describe("streamOpenAIChatToAnthropicSse", () => {
     expect(output).toContain("event: message_stop");
   });
 
-  it("rethrows upstream stream error instead of disguising it as assistant text", async () => {
+  it("rethrows upstream stream error when no content has been emitted yet", async () => {
     async function* errorStream(): AsyncIterable<StreamChunk> {
-      yield { choices: [{ delta: { content: "partial" }, finish_reason: null }] };
+      // Empty delta — no content is emitted, so the no-output re-throw path
+      // fires. Previously content like 'partial' was swallowed by the parser
+      // buffer; now it's flushed and treated as output (see mid-stream notice
+      // tests for the had-content path).
+      yield { choices: [{ delta: {}, finish_reason: null }] };
       throw new Error("upstream disconnected");
     }
 
@@ -164,12 +168,8 @@ describe("streamOpenAIChatToAnthropicSse", () => {
       true,
     );
 
-    // The converter must surface the failure by rethrowing so the route layer
-    // can emit a top-level SSE `event: error` and mark the termination reason.
-    // The original bug swallowed the error, wrapped its message in a `text`
-    // content block, and signalled `end_turn` + `message_stop` — making the
-    // client treat the failure as a completed assistant turn and persist the
-    // error string into conversation history.
+    // When no output was produced, the converter rethrows so the route layer
+    // can emit a top-level SSE `event: error`.
     await expect(collectStream(stream)).rejects.toThrow("upstream disconnected");
   });
 

@@ -180,14 +180,12 @@ async function* iterUpstreamChunks(
         ({ done, value } = await reader.read());
       } catch (e) {
         // Upstream connection dropped mid-stream (reset/abort). Propagate as
-        // UpstreamAbortedError; the route layer catch builds a cc-switch-aligned
-        // mid-stream `event: error` (error.type=stream_error, descriptive
-        // message, NO overloaded_error substring) after closing any open content
-        // blocks — never an abrupt close, which claude-code reports as "empty or
-        // malformed response (HTTP 200)" and never persists. By design this does
-        // NOT trigger a claude-code client retry (see buildMidStreamErrorSse).
+        // UpstreamAbortedError with 'connection_closed' subtype so the stream
+        // layer can surface the correct Claude-standard incomplete notice
+        // ("Connection closed mid-response") when output has already started,
+        // or emit a top-level `event: error` when no output was produced yet.
         const msg = e instanceof Error ? e.message : String(e);
-        throw new UpstreamAbortedError(`Upstream stream read error: ${msg}`);
+        throw new UpstreamAbortedError(`Upstream stream read error: ${msg}`, 'connection_closed');
       }
       if (done) break;
 
