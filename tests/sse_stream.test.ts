@@ -937,13 +937,14 @@ describe("SSE stream forwarding", () => {
       // Verify dump was finalized: directory renamed with __START_ and __END_
       const { readdirSync } = await import("node:fs");
       await new Promise((r) => setTimeout(r, 50));
-      const dirs = readdirSync(tmpDir);
+      const dumpSubdir = `${tmpDir}/upstream-aborted`;
+      const dirs = readdirSync(dumpSubdir);
       expect(dirs.some((d) => d.includes("__START_") && d.includes("__END_"))).toBe(true);
 
       // Verify the renamed dir contains all expected log files
       const renamedDir = dirs.find((d) => d.includes("__START_"))!;
       const { readdirSync: readdir2 } = await import("node:fs");
-      const files = readdir2(`${tmpDir}/${renamedDir}`);
+      const files = readdir2(`${dumpSubdir}/${renamedDir}`);
       expect(files).toContain("downstream-request.log");
       expect(files).toContain("upstream-request.log");
       expect(files).toContain("upstream-response.log");

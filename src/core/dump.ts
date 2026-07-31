@@ -80,6 +80,17 @@ export interface DumpSession {
   finish(): void;
 }
 
+function getTargetSubdir(reason: TerminationReason | undefined): string {
+  switch (reason) {
+    case "completed":       return "completed";
+    case "client_abort":    return "client-aborted";
+    case "upstream_abort":  return "upstream-aborted";
+    case "upstream_timeout":
+    case "upstream_error":
+    default:                return "failed";
+  }
+}
+
 const noopSession: DumpSession = {
   writeDownstreamRequest() {},
   writeUpstreamRequest() {},
@@ -140,9 +151,10 @@ export function createDumpSession(dumpDir: string): DumpSession {
   if (!dumpDir) return noopSession;
 
   const id = randomUUIDv7();
-  const tmpDir = `${dumpDir}/${id}`;
+  const tmpDir = `${dumpDir}/in-progress/${id}`;
   const startTime = new Date();
   let finished = false;
+  let _terminationReason: TerminationReason | undefined;
   let timing: DumpTiming | undefined;
 
   try { mkdirSync(dumpDir, { recursive: true }); } catch {}
@@ -184,9 +196,11 @@ export function createDumpSession(dumpDir: string): DumpSession {
       try { writeFileSync(`${tmpDir}/upstream-request.log`, formatRequestLog(meta)); } catch {}
     },
     writeUpstreamResponse(meta: DumpUpstreamResponseMeta) {
+      if (meta.termination?.reason) _terminationReason = meta.termination.reason;
       try { writeFileSync(`${tmpDir}/upstream-response.log`, formatResponseLog(meta)); } catch {}
     },
     writeDownstreamResponse(meta: DumpDownstreamResponseMeta) {
+      if (meta.termination?.reason) _terminationReason = meta.termination.reason;
       try { writeFileSync(`${tmpDir}/downstream-response.log`, formatResponseLog(meta, timing)); } catch {}
     },
     setTiming(t: DumpTiming) {
@@ -204,7 +218,10 @@ export function createDumpSession(dumpDir: string): DumpSession {
       }
       const endTime = new Date();
       const finalName = `${id}__START_${formatTime(startTime)}__END_${formatTime(endTime)}`;
-      try { renameSync(tmpDir, `${dumpDir}/${finalName}`); } catch {}
+      const targetSubdir = getTargetSubdir(_terminationReason);
+      const targetDir = `${dumpDir}/${targetSubdir}`;
+      try { mkdirSync(targetDir, { recursive: true }); } catch {}
+      try { renameSync(tmpDir, `${targetDir}/${finalName}`); } catch {}
     },
   };
 }
