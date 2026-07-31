@@ -551,6 +551,11 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     config.enableThinking,
     config.serverTools,
     dump,
+    // The stream layer reports the TRUE upstream termination (e.g. an abort it
+    // swallowed to complete the downstream turn gracefully) to the dump, gated
+    // on the downstream client NOT having initiated the disconnect. The
+    // closure reads downstreamAborted live so a later cancel() flips the gate.
+    { isDownstreamAborted: () => downstreamAborted },
   );
 
   const downstreamChunks: string[] = [];
@@ -565,11 +570,20 @@ export async function handleMessages(request: Request, config: ServerConfig): Pr
     dumpFinished = true;
     const disconnectTime = terminationReason !== "completed" ? new Date().toISOString() : undefined;
     const termination: DumpTermination = { reason: terminationReason, disconnectTime };
+    // The upstream log records the TRUE upstream outcome — what the upstream
+    // connection actually did — which the stream layer reports separately
+    // (recordUpstreamTermination) when it completes the downstream turn
+    // gracefully despite an upstream abort (Case B). The downstream log records
+    // the downstream protocol outcome (termination above). When the stream
+    // layer did not report an upstream termination (normal completion,
+    // client-abort, upstream_error/timeout), fall back to the tracked
+    // downstream termination so the upstream log is never blank.
+    const upstreamTermination = dump.getUpstreamTermination();
     dump.writeUpstreamResponse({
       headers: upstreamHeaders,
       status: upstreamStatus,
       body: rawUpstreamChunks.join(""),
-      termination,
+      termination: upstreamTermination ?? termination,
     });
     dump.writeDownstreamResponse({
       headers: downstreamHeaders,

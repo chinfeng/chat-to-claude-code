@@ -956,6 +956,155 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
+  // Case B: upstream aborts AFTER output has started. The stream layer
+  // swallows the abort and completes the turn gracefully (partial preserved +
+  // incomplete-notice + message_stop), so the downstream PROTOCOL outcome is
+  // "completed" — but the DUMP must still record the TRUE root cause: the
+  // upstream never sent finish_reason and never sent [DONE]. Pre-fix this was
+  // mis-categorized into completed/ with upstream-response.log falsely reading
+  // "Reason: completed" (the body was honestly incomplete, the Termination
+  // field was a lie). The fix: the stream layer reports the real upstream
+  // outcome to the dump, gated on "the downstream did NOT initiate the
+  // disconnect" so a client self-abort is not mislabeled.
+  // -----------------------------------------------------------------------
+
+  it("categorizes an upstream abort WITH prior content into upstream-aborted/ and records the true upstream termination", async () => {
+    // Content, then a connection reset. The test client reads the response to
+    // completion (never aborts) — genuine upstream abort, NOT client-initiated.
+    mockFetchWithErrorAfterContent(
+      [
+        sseData({
+          id: "chatcmpl-caseB",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-4o",
+          choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: null }],
+        }),
+      ],
+      "Connection reset by peer",
+    );
+
+    const tmpDir = `${import.meta.dir}/.test-dump-caseB-${Date.now()}`;
+    const configWithDump: ServerConfig = { ...TEST_CONFIG, dumpDir: tmpDir };
+    try {
+      const res = await routeRequest(makeMessagesRequest(), configWithDump);
+      expect(res.status).toBe(200);
+      const body = await collectResponseBody(res);
+
+      // Proves we exercised the hadContent swallow path (not the no-content
+      // re-throw): notice appended, turn completed normally, no event:error.
+      expect(body).toContain("API Error: Connection closed mid-response. The response above may be incomplete.");
+      expect(parseSseResponse(body).some((e) => e.event === "error")).toBe(false);
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const { existsSync, readdirSync, readFileSync } = await import("node:fs");
+      // Root cause = upstream abort → dump categorized into upstream-aborted/.
+      expect(existsSync(`${tmpDir}/upstream-aborted`)).toBe(true);
+      const dumpSubdir = `${tmpDir}/upstream-aborted`;
+      const dirs = readdirSync(dumpSubdir);
+      const renamedDir = dirs.find((d) => d.includes("__START_"))!;
+
+      // upstream-response.log records the TRUE upstream outcome (not
+      // "completed"): the upstream sent finish_reason=null and no [DONE]
+      // before the drop.
+      const upstreamResp = readFileSync(`${dumpSubdir}/${renamedDir}/upstream-response.log`, "utf8");
+      expect(upstreamResp).toContain("Reason: upstream_abort");
+      expect(upstreamResp).toContain("DisconnectTime:");
+
+      // downstream-response.log records the downstream protocol outcome — the
+      // turn completed gracefully (message_stop), so it reads "completed"
+      // and must NOT be stamped with upstream_abort.
+      const downstreamResp = readFileSync(`${dumpSubdir}/${renamedDir}/downstream-response.log`, "utf8");
+      expect(downstreamResp).toContain("Reason: completed");
+      expect(downstreamResp).not.toContain("Reason: upstream_abort");
+    } finally {
+      const { rmSync } = await import("node:fs");
+      try { rmSync(tmpDir, { recursive: true }); } catch {}
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Non-regression: when the DOWNSTREAM client initiates the disconnect
+  // mid-stream (after content), the root cause is the client → categorize as
+  // client-aborted/, NOT upstream-aborted/. The upstream read teardown that
+  // follows (reader.cancel()) must not be misread as an upstream abort.
+  // -----------------------------------------------------------------------
+
+  it("keeps a client-initiated abort (after content) categorized as client-aborted/, not upstream-aborted/", async () => {
+    // Upstream streams many content chunks with small delays — it is still
+    // mid-stream when the DOWNSTREAM consumer cancels. The root cause is the
+    // client, not the upstream. (Mirrors the proven read-then-cancel shape:
+    // mockFetchWithDelayedSse + read a few events + reader.cancel().)
+    const chunks: string[] = [
+      sseData({
+        id: "chatcmpl-clientabort",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+      }),
+    ];
+    for (let i = 0; i < 50; i++) {
+      chunks.push(
+        sseData({
+          id: "chatcmpl-clientabort",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-4o",
+          choices: [{ index: 0, delta: { content: `chunk${i} ` }, finish_reason: null }],
+        }),
+      );
+    }
+    mockFetchWithDelayedSse(chunks, 5);
+
+    const tmpDir = `${import.meta.dir}/.test-dump-clientabort-${Date.now()}`;
+    const configWithDump: ServerConfig = { ...TEST_CONFIG, dumpDir: tmpDir };
+    try {
+      const res = await routeRequest(makeMessagesRequest(), configWithDump);
+      expect(res.status).toBe(200);
+
+      // Read a few downstream events (content is now flowing → hadContent is
+      // true inside the stream layer), then cancel like a disconnecting
+      // client — the authoritative "downstream left" signal is the response-
+      // body cancel, which fires the route's cancel() callback (NOT the
+      // request abort signal, which only aborts the upstream fetch).
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let partial = "";
+      for (let i = 0; i < 3; i++) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        partial += decoder.decode(value, { stream: true });
+      }
+      expect(partial.length).toBeGreaterThan(0);
+      await reader.cancel();
+      await new Promise((r) => setTimeout(r, 80));
+
+      const { existsSync, readdirSync, readFileSync } = await import("node:fs");
+      // Root cause = client disconnect → client-aborted/.
+      expect(existsSync(`${tmpDir}/client-aborted`)).toBe(true);
+      const dumpSubdir = `${tmpDir}/client-aborted`;
+      const dirs = readdirSync(dumpSubdir);
+      const renamedDir = dirs.find((d) => d.includes("__START_"))!;
+      // Must NOT have been mis-categorized as an upstream abort.
+      expect(existsSync(`${tmpDir}/upstream-aborted`)).toBe(false);
+
+      // The upstream-response.log must record the TRUE root cause (client
+      // disconnect), NOT upstream_abort. This guards the stream layer's
+      // isDownstreamAborted() gate: without the gate, the cancel-induced
+      // upstream-read teardown would be recorded as an upstream abort even
+      // though the client caused it.
+      const upstreamResp = readFileSync(`${dumpSubdir}/${renamedDir}/upstream-response.log`, "utf8");
+      expect(upstreamResp).toContain("Reason: client_abort");
+      expect(upstreamResp).not.toContain("Reason: upstream_abort");
+    } finally {
+      const { rmSync } = await import("node:fs");
+      try { rmSync(tmpDir, { recursive: true }); } catch {}
+    }
+  });
+
+  // -----------------------------------------------------------------------
   // G1: request OpenAI-standard `stream_options.include_usage` from the
   //     upstream so the trailing usage chunk arrives and message_delta can
   //     report real token counts (paired with G3 cache extraction + G4 real

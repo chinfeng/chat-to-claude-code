@@ -77,6 +77,13 @@ export interface DumpSession {
   writeDownstreamResponse(meta: DumpDownstreamResponseMeta): void;
   setTiming(timing: DumpTiming): void;
   logServerTool(entry: ServerToolLogEntry): void;
+  /** Record the TRUE upstream outcome to the dump. Called by the stream layer
+   *  when it detects the upstream aborted even though it completed the
+   *  downstream turn gracefully (hadContent swallow path). No-op once the
+   *  session has finished, so a later cancel()/finish() cannot overwrite it. */
+  recordUpstreamTermination(reason: TerminationReason, disconnectTime?: string): void;
+  /** The recorded upstream outcome, if the stream layer reported one. */
+  getUpstreamTermination(): DumpTermination | undefined;
   finish(): void;
 }
 
@@ -91,6 +98,34 @@ function getTargetSubdir(reason: TerminationReason | undefined): string {
   }
 }
 
+/** Decide the dump bucket's root-cause termination. The reasons we track come
+ *  from two places: the route's downstream outcome (`tracked` — what happened
+ *  to the downstream turn) and the stream layer's separate report of what the
+ *  UPSTREAM did (`upstream`, recorded via recordUpstreamTermination). They
+ *  describe different halves of the same request and can disagree:
+ *
+ *   - Case B (upstream aborts after content): the stream layer completes the
+ *     downstream turn gracefully (partial preserved + notice + message_stop),
+ *     so `tracked` = "completed"; but the upstream never sent finish_reason /
+ *     [DONE], so the stream layer recorded `upstream` = upstream_abort. The
+ *     root cause is the upstream abort → the bucket must reflect `upstream`.
+ *   - client disconnect (downstream cancels mid-stream): `tracked` =
+ *     "client_abort"; the stream-layer read teardown that follows may look
+ *     like an upstream abort, but the CLIENT initiated it → client_abort must
+ *     win over any upstream report.
+ *
+ *  Precedence: a downstream-initiated client disconnect beats everything;
+ *  then the upstream's own recorded outcome; then the tracked downstream
+ *  outcome. */
+function pickTerminationReason(
+  tracked: TerminationReason | undefined,
+  upstream: DumpTermination | undefined,
+): TerminationReason | undefined {
+  if (tracked === "client_abort") return "client_abort";
+  if (upstream?.reason) return upstream.reason;
+  return tracked;
+}
+
 const noopSession: DumpSession = {
   writeDownstreamRequest() {},
   writeUpstreamRequest() {},
@@ -98,6 +133,8 @@ const noopSession: DumpSession = {
   writeDownstreamResponse() {},
   setTiming() {},
   logServerTool() {},
+  recordUpstreamTermination() {},
+  getUpstreamTermination() { return undefined; },
   finish() {},
 };
 
@@ -155,6 +192,7 @@ export function createDumpSession(dumpDir: string): DumpSession {
   const startTime = new Date();
   let finished = false;
   let _terminationReason: TerminationReason | undefined;
+  let _upstreamTermination: DumpTermination | undefined;
   let timing: DumpTiming | undefined;
 
   try { mkdirSync(dumpDir, { recursive: true }); } catch {}
@@ -209,6 +247,16 @@ export function createDumpSession(dumpDir: string): DumpSession {
     logServerTool(entry: ServerToolLogEntry) {
       serverToolLogs.push(formatServerToolEntry(entry));
     },
+    recordUpstreamTermination(reason: TerminationReason, disconnectTime?: string) {
+      // No-op once the session has finished — a later cancel()/finish() must
+      // not be able to retroactively relabel the upstream outcome with the
+      // downstream teardown state.
+      if (finished) return;
+      _upstreamTermination = { reason, disconnectTime };
+    },
+    getUpstreamTermination() {
+      return _upstreamTermination;
+    },
     finish() {
       if (finished) return;
       finished = true;
@@ -218,7 +266,10 @@ export function createDumpSession(dumpDir: string): DumpSession {
       }
       const endTime = new Date();
       const finalName = `${id}__START_${formatTime(startTime)}__END_${formatTime(endTime)}`;
-      const targetSubdir = getTargetSubdir(_terminationReason);
+      // The bucket reflects the ROOT CAUSE, which can differ from the tracked
+      // downstream outcome (e.g. an upstream abort the stream layer swallowed
+      // to complete the downstream turn gracefully). See pickTerminationReason.
+      const targetSubdir = getTargetSubdir(pickTerminationReason(_terminationReason, _upstreamTermination));
       const targetDir = `${dumpDir}/${targetSubdir}`;
       try { mkdirSync(targetDir, { recursive: true }); } catch {}
       try { renameSync(tmpDir, `${targetDir}/${finalName}`); } catch {}

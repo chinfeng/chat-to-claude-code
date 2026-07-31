@@ -163,6 +163,14 @@ export interface StreamOptions {
   /** Starting block index for content blocks. Used when server_tool_use
    * blocks have already been emitted before this stream starts. */
   startingBlockIndex?: number;
+  /** Reports whether the DOWNSTREAM client has already disconnected. When
+   * provided and currently aborted, the stream layer must NOT report an
+   * upstream termination to the dump — the disconnect is downstream-initiated
+   * (the route's cancel() path owns that root-cause label), and the
+   * upstream-read teardown that follows is a consequence, not the cause.
+   * When omitted, upstream-termination reporting is skipped entirely (the
+   * agentic flow does not wire this and is handled separately). */
+  isDownstreamAborted?: () => boolean;
 }
 
 /** Extract Anthropic-compatible usage from an OpenAI usage chunk.
@@ -465,6 +473,20 @@ export async function* streamOpenAIChatToAnthropicSse(
       if (!options?.skipMessageLifecycle) {
         yield sse.message_delta(mapStopReason(finishReason), completion);
         yield sse.message_stop();
+      }
+      // The upstream aborted (read threw / stall-detected without
+      // finish_reason), but we completed the downstream turn gracefully. Record
+      // the TRUE upstream outcome to the dump so the bucket reflects the root
+      // cause (upstream_abort), not the graceful downstream completion. This is
+      // gated on the downstream NOT having initiated the disconnect: the
+      // upstream-read teardown that follows a client cancel looks identical to
+      // an upstream abort, but the cause is the client (the route's cancel()
+      // path owns that label). Only the standard flow wires isDownstreamAborted;
+      // when omitted (agentic flow) recording is skipped so its categorization
+      // is left unchanged.
+      const checkDownstreamAborted = options?.isDownstreamAborted;
+      if (dump && checkDownstreamAborted && !checkDownstreamAborted()) {
+        dump.recordUpstreamTermination("upstream_abort", new Date().toISOString());
       }
       return; // Exit generator — skip normal post-processing (no orphan repair, etc.)
     }
