@@ -1156,11 +1156,13 @@ async function handleServerToolRequest(
                     headers: upstreamHeaders,
                     status: finalRes.status,
                     body: finalRawChunks.join(""),
+                    termination: { reason: "completed" },
                 });
                 dump.writeDownstreamResponse({
                     headers: downstreamHeaders,
                     status: 200,
                     body: downstreamChunks.join(""),
+                    termination: { reason: "completed" },
                 });
                 dump.setTiming({ ttfb: Date.now() - requestStartMs, totalTime: Date.now() - requestStartMs });
             } catch (e) {
