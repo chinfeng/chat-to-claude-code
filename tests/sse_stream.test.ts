@@ -288,7 +288,7 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 1: fire-and-forget in start() — highWaterMark saturation causing
+  // Regression guard — Bug 1 (fixed): fire-and-forget in start() — highWaterMark saturation causing
   //         events to be silently dropped after message_start
   // -----------------------------------------------------------------------
 
@@ -351,7 +351,7 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 2: pull() → start() mode switch — stream stalling after
+  // Regression guard — Bug 2 (fixed): pull() → start() mode switch — stream stalling after
   //         yielding message_start (output_tokens=1)
   // -----------------------------------------------------------------------
 
@@ -378,7 +378,7 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 3: reader lock not released — leaked stream locks
+  // Regression guard — Bug 3 (fixed): reader lock not released — leaked stream locks
   // -----------------------------------------------------------------------
 
   it("releases reader lock after stream completes (no leaked locks)", async () => {
@@ -436,7 +436,7 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 4: an upstream connection abort surfaces downstream as an explicit
+  // Regression guard — Bug 4 (fixed): an upstream connection abort surfaces downstream as an explicit
   //         `event: error` carrying `error.type = "stream_error"` so claude-code
   //         reports the failure cleanly and never persists a partial turn — never
   //         an abrupt close, which it reports as "empty or malformed response
@@ -690,7 +690,7 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 5: race condition between cancel() and start() writing
+  // Regression guard — Bug 5 (fixed): race condition between cancel() and start() writing
   //         duplicate dump logs
   // -----------------------------------------------------------------------
 
@@ -832,7 +832,7 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 6: abort signal forwarded to fetch() — when client disconnects
+  // Regression guard — Bug 6 (fixed): abort signal forwarded to fetch() — when client disconnects
   // before upstream responds, fetch() is cancelled (not left hanging)
   // and dump is finalized
   // -----------------------------------------------------------------------
@@ -893,7 +893,7 @@ describe("SSE stream forwarding", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Bug 7: finalizeDump always runs — even when upstream errors mid-
+  // Regression guard — Bug 7 (fixed): finalizeDump always runs — even when upstream errors mid-
   // stream, the dump directory is renamed with START/END timestamps
   // -----------------------------------------------------------------------
 
